@@ -4,15 +4,17 @@ import numpy as np
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torch.nn.functional import softmax, cross_entropy
-from transformers import AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer,AutoModel, get_linear_schedule_with_warmup,AutoModelForSequenceClassification
 from utils.eci_controller import ECIThresholdController
 
 from utils.loss import calculate_batch_entropy_from_logits, kl_divergence_loss_from_logits
-
+import torchvision
+torchvision.disable_beta_transforms_warning()
 
 # PEFT Configuration (Example LoRA)
-USE_PEFT = False # Set to True to enable PEFT
+USE_PEFT = True # Set to True to enable PEFT
 peft_config = None
+
 if USE_PEFT:
     try:
         from peft import LoraConfig, TaskType, get_peft_model
@@ -33,39 +35,40 @@ class LLMBasedTrafficClassifier(nn.Module):
     def __init__(self, llm_model_name, num_classes_output, freeze_llm_base=False):
         super().__init__()
         import inspect
-        self.llm = AutoModel.from_pretrained(llm_model_name, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token  # 或者 "<|endoftext|>"，视模型而定
         self.num_classes_output = num_classes_output # Number of classes this specific head outputs (e.g., NUM_BASE_CLASSES)
+
+        self.llm = AutoModelForSequenceClassification.from_pretrained(llm_model_name, num_labels=num_classes_output, pad_token_id=tokenizer.pad_token_id, trust_remote_code=True, torch_dtype=torch.float16, low_cpu_mem_usage=True).to('cuda')
         self.accepts_token_type_ids = 'token_type_ids' in inspect.signature(self.llm.forward).parameters
         current_peft_config = peft_config
         if freeze_llm_base and not current_peft_config: # Freeze only if not using PEFT or if PEFT implies freezing
             for param in self.llm.parameters():
                 param.requires_grad = False
-        
+
         if current_peft_config and USE_PEFT:
             self.llm = get_peft_model(self.llm, current_peft_config)
             print(f"Applied PEFT to LLM. Trainable params:")
             self.llm.print_trainable_parameters()
 
-        llm_hidden_size = self.llm.config.hidden_size
-        self.classifier_head = nn.Linear(llm_hidden_size, num_classes_output)
 
-    # def forward(self, input_ids, attention_mask, token_type_ids=None):
-    #     if token_type_ids is not None and token_type_ids.nelement() > 0 and token_type_ids.numel() == input_ids.numel() : # Check if not empty and shape is compatible
-    #          outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-    #     else:
-    #          outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
-        
-    #     pooled_output = outputs.last_hidden_state[:, 0] # CLS token embedding for BERT-like
-    #     logits = self.classifier_head(pooled_output)
-    #     return logits
     def forward(self, input_ids, attention_mask, token_type_ids=None):
+        # Remove any unexpected kwargs that might be passed from the training loop
+        kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
         if self.accepts_token_type_ids and token_type_ids is not None and token_type_ids.nelement() > 0 and token_type_ids.numel() == input_ids.numel():
             outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
         else:
             outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.last_hidden_state[:, 0].to(torch.float32) # CLS token embedding for BERT-like
-        logits = self.classifier_head(pooled_output)
-        return logits
+            # kwargs['token_type_ids'] = token_type_ids
+        
+        outputs = self.llm(**kwargs)
+        # pooled_output = outputs.last_hidden_state[:, 0].to(torch.float32) # CLS token embedding for BERT-like
+        # logits = self.classifier_head(pooled_output)
+        return outputs.logits
 
 class LLMTrafficDECOOP:
     def __init__(self, args):
@@ -114,7 +117,7 @@ class LLMTrafficDECOOP:
         if not optimizer_grouped_parameters: # If all frozen
             return None, None
 
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+        optimizer = torch.optim.Adam(optimizer_grouped_parameters)
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
         return optimizer, scheduler
     
@@ -126,7 +129,7 @@ class LLMTrafficDECOOP:
         """
         print("🧪 开始 ECI 阈值校准（Conformal）...")
         device = self.device
-        calib_loader = DataLoader(calibration_dataset, batch_size=1, shuffle=False)
+        calib_loader = DataLoader(calibration_dataset, batch_size=4, shuffle=False)
         updated_samples = 0
 
         for sample in calib_loader:
@@ -177,36 +180,48 @@ class LLMTrafficDECOOP:
                 input_ids = batch_data['input_ids'].to(device)
                 attention_mask = batch_data['attention_mask'].to(device)
                 token_type_ids = batch_data.get('token_type_ids')
-                if token_type_ids is not None and token_type_ids.nelement() > 0 : token_type_ids = token_type_ids.to(device)
-                else: token_type_ids = None # Explicitly set to None if empty
-                
-                labels_local = batch_data['labels'].to(device) # These are local indices for base class models
+                if token_type_ids is not None and token_type_ids.nelement() > 0:
+                    token_type_ids = token_type_ids.to(device)
+                else:
+                    token_type_ids = None  # Explicitly set to None if empty
+
+                labels_local = batch_data['labels'].to(device)  # These are local indices for base class models
 
                 optimizer.zero_grad()
+                # Only pass the required arguments to the model's forward method
                 logits = model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                
+
+                # Insert debug check for label range before computing loss for ZS Classifier
+                if model_description == "ZS Classifier":
+                    if torch.any(labels_local >= logits.shape[1]) or torch.any(labels_local < 0):
+                        print(f"❌ Error: label out of range. Max label: {labels_local.max()}, num classes: {logits.shape[1]}")
+                        print(f"Labels: {labels_local}")
+                        print(f"Logits shape: {logits.shape}")
+                        raise ValueError("Invalid label detected in ZS classifier training.")
+
                 # loss_calculation_fn is specific to ZS, Detector, or Sub-classifier
                 # It might need more than just logits and labels (e.g., other model outputs or data parts for DECOOP losses)
                 # For simplicity, we assume it can be called like this for now:
                 # For Detector: loss_calculation_fn(logits_sim_base, labels_sim_base, logits_sim_new)
                 # For Sub-classifier: loss_calculation_fn(logits_d_b_i, labels_d_b_i, logits_d_n_i, zs_detached_model, features_d_n_i)
                 # This generic loop might need to be specialized for each component if loss_calculation_fn becomes too complex.
-                
+
                 # This is a simplification: loss_calculation_fn needs to handle DECOOP's complex structure
                 # For a simple CE loss (like for ZS classifier):
-                if model_description == "ZS Classifier": # ZS uses simple CE
+                if model_description == "ZS Classifier":  # ZS uses simple CE
                     loss = cross_entropy(logits, labels_local)
-                else: # For Detectors and Sub-classifiers, loss_calculation_fn would be more complex
-                      # This placeholder won't work for them without passing more args to loss_calculation_fn
-                      # For now, let's assume it's passed within batch_data for complex losses (not ideal)
-                    loss = loss_calculation_fn(logits, labels_local, model, batch_data) # model and batch_data passed for flexibility
+                else:  # For Detectors and Sub-classifiers, loss_calculation_fn would be more complex
+                    # This placeholder won't work for them without passing more args to loss_calculation_fn
+                    # For now, let's assume it's passed within batch_data for complex losses (not ideal)
+                    loss = loss_calculation_fn(logits, labels_local, model, batch_data)  # model and batch_data passed for flexibility
 
                 loss.backward()
                 optimizer.step()
-                if scheduler: scheduler.step()
+                if scheduler:
+                    scheduler.step()
                 epoch_loss += loss.item()
                 processed_batches += 1
-            
+
             if processed_batches > 0:
                 print(f"Epoch {epoch+1}/{num_epochs}, {model_description} Avg Loss: {epoch_loss/processed_batches:.4f}")
         print(f"Finished training {model_description}")
@@ -406,7 +421,7 @@ class LLMTrafficDECOOP:
                  print(f"  Epoch {epoch+1}, Sub-classifier {classifier_idx+1} Combined Loss: {epoch_loss_val/batches_done:.4f}")
         print(f"Finished training Sub-classifier {classifier_idx+1}")
 
-    def fit(self, train_dataset_base_local_labels):
+    def fit(self, train_dataset):
 
         device = self.device
         if self.base_class_global_indices_ is None:
@@ -414,7 +429,7 @@ class LLMTrafficDECOOP:
 
         # 1. Train ZS Classifier （全体样本 + 冻结LLM）
         print("Training ZS/General LLM Classifier...")
-        zs_dataloader = DataLoader(train_dataset_base_local_labels, batch_size=self.batch_size, shuffle=True)
+        zs_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         
         def zs_loss_fn(logits, labels, model=None, batch_data=None): # model and batch_data not used for simple CE
             return cross_entropy(logits, labels)
@@ -422,13 +437,13 @@ class LLMTrafficDECOOP:
         
         # Detached ZS model for sub-classifier's KL divergence target
         zs_classifier_detached = LLMBasedTrafficClassifier(self.llm_model_name, self.num_base_classes, freeze_llm_base=True).to(device)
-        zs_classifier_detached.load_state_dict(self.zs_classifier_.state_dict()) # Copy weights
-        zs_classifier_detached.eval()
+        zs_classifier_detached.load_state_dict(self.zs_classifier_.state_dict()) # Copy llm weights
+        zs_classifier_detached.eval() # no train
 
         # 2. Train K New Class Detectors
         for i in range(self.k_detectors):
             detector = LLMBasedTrafficClassifier(self.llm_model_name, self.num_base_classes, freeze_llm_base=False).to(device) # Detectors might need to fine-tune LLM more
-            self._train_detector_component(detector, train_dataset_base_local_labels, i, self.n_epochs_detector)
+            self._train_detector_component(detector, train_dataset, i, self.n_epochs_detector)
             self.new_class_detectors_.append(detector)
         
         # TODO: Implement actual Otsu threshold calculation based on all detectors' outputs
@@ -444,7 +459,7 @@ class LLMTrafficDECOOP:
             
             if i < len(self.new_class_detectors_): # Ensure detector exists
                 self._train_subclassifier_component(sub_classifier, self.new_class_detectors_[i], 
-                                                  train_dataset_base_local_labels, zs_classifier_detached, 
+                                                  train_dataset, zs_classifier_detached, 
                                                   i, self.n_epochs_subcls)
                 self.sub_classifiers_.append(sub_classifier)
             else: # Fallback for safety if a detector failed to instantiate
@@ -523,4 +538,3 @@ class LLMTrafficDECOOP:
         current_sum = np.sum(output_probas_all_classes)
         if current_sum == 0: return np.ones(self.num_all_classes) / self.num_all_classes
         return output_probas_all_classes / current_sum
-

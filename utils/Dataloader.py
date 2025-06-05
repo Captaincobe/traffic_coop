@@ -66,6 +66,8 @@ class LLMCSVTrafficDataset(Dataset):
         self.label_column = label_column
         self.is_training_data = is_training_data
         self.dataset_name = dataset_name
+        self.prompt_prefix = "Traffic classification sample:"
+        self.max_seq_len = max_len  # 这样 __getitem__ 中就可以用
 
         if self.is_training_data:
             if base_class_global_indices is None:
@@ -85,39 +87,48 @@ class LLMCSVTrafficDataset(Dataset):
             self.global_to_local_base_map = {global_idx: local_idx for local_idx, global_idx in enumerate(sorted_base_class_global_indices)}
             # 验证所有 base_class_global_indices 是否真的存在于 self.label_map 的值中
             # (这一步通常在创建 base_class_global_indices_sorted 时已经隐含处理了，但可以加一道保险)
-            # for global_idx in sorted_base_class_global_indices:
-            #     if global_idx not in self.label_map.values(): # 或者更准确地，检查它们是否是预期的基类标签对应的索引
-            #         raise ValueError(f"Global base class index {global_idx} not found in the values of the provided label_map.")
+            for global_idx in sorted_base_class_global_indices:
+                if global_idx not in self.label_map.values(): # 或者更准确地，检查它们是否是预期的基类标签对应的索引
+                    raise ValueError(f"Global base class index {global_idx} not found in the values of the provided label_map.")
 
     def __len__(self):
         return len(self.dataframe)
 
     def __getitem__(self, idx):
         row = self.dataframe.iloc[idx]
-        # feature_text = convert_feature_to_prompt_text(self.df.iloc[idx][self.feature_cols])
-        # full_input = self.prompt_prefix + " " + feature_text
-        # tokenized = self.tokenizer(full_input, truncation=True, max_length=self.max_seq_len, padding="max_length", return_tensors="pt")
-        
-        text_sequence = traffic_features_to_text(self.dataset_name, row[self.feature_columns] )
-        global_label_numerical = self.label_map.get(row[self.label_column])
-        if global_label_numerical is None:
-            raise ValueError(f"Label '{row[self.label_column]}' not found in label_map. Available: {list(self.label_map.keys())}")
+        global_label_str = row[self.label_column]
+        global_label_numerical = self.label_map.get(global_label_str)
 
-        encoding = self.tokenizer.encode_plus(
-            text_sequence, add_special_tokens=True, max_length=self.max_len,
-            return_token_type_ids=True, padding='max_length', truncation=True,
-            return_attention_mask=True, return_tensors='pt')
-        target_label_numerical = -1
+        if global_label_numerical is None:
+            raise ValueError(f"Label '{global_label_str}' not found in label_map.")
+
+        feature_text = convert_feature_to_prompt_text(row[self.feature_columns])
+        full_input = f"{self.prompt_prefix} {feature_text}"
+
+        tokenized = self.tokenizer(
+            full_input,
+            truncation=True,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
         if self.is_training_data:
-            target_label_numerical = self.global_to_local_base_map.get(global_label_numerical)
-            if target_label_numerical is None:
-                raise ValueError(f"Training data error: Global label {global_label_numerical} ('{row[self.label_column]}') not base class.")
-        else: 
+            # 映射为局部索引标签（用于 base class）
+            target_label_numerical = self.global_to_local_base_map.get(global_label_numerical, -1)
+            # print(f"[DEBUG] idx={idx}, global_label_str={global_label_str}, global_label_numerical={global_label_numerical}, mapped_local_label={target_label_numerical}")
+            if target_label_numerical == -1:
+                raise ValueError(f"Training data error: label {global_label_str} ({global_label_numerical}) not in base_class set.")
+        else:
             target_label_numerical = global_label_numerical
+
+        # Validation check: ensure label is in valid range
+        if not (isinstance(target_label_numerical, int) and target_label_numerical >= 0):
+            raise ValueError(f"Label mapping error at idx={idx}: mapped label ({target_label_numerical}) is not a valid non-negative integer. Original label: {global_label_str} ({global_label_numerical})")
+
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'token_type_ids': encoding['token_type_ids'].flatten() if 'token_type_ids' in encoding and encoding['token_type_ids'] is not None else torch.tensor([]),
-            'labels': torch.tensor(target_label_numerical, dtype=torch.long),
-            'global_labels': torch.tensor(global_label_numerical, dtype=torch.long) # Always include global label for potential use
+            "input_ids": tokenized["input_ids"].squeeze(0),
+            "attention_mask": tokenized["attention_mask"].squeeze(0),
+            "labels": torch.tensor(target_label_numerical, dtype=torch.long),  # local label
+            "global_labels": torch.tensor(global_label_numerical, dtype=torch.long)
         }

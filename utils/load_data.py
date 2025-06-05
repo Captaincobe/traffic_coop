@@ -9,7 +9,7 @@ def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_label
     max_seq_len_for_llm = args.MAX_SEQ_LENGTH
     dataset_name = args.dataset_name
     # (Using the implementation from the previous response, ensure it returns base_class_global_indices_sorted)
-    csv_path = f'/home/icdm/code/trafficCOOP/dataset/{dataset_name}/dataset.csv'
+    csv_path = f'/home/icdm/code/trafficCOOP/datasets/{dataset_name}/raw/{dataset_name}--1.csv'
     df = pd.read_csv(csv_path)
     feature_cols = [col for col in df.columns if col != 'label']
     if not feature_cols: raise ValueError("No feature columns found.")
@@ -21,7 +21,7 @@ def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_label
     args.NUM_BASE_CLASSES = len(base_traffic_labels_str)
     args.NUM_ALL_CLASSES = len(all_class_labels_global_map)
     base_class_global_indices_sorted = sorted([all_class_labels_global_map[l] for l in base_traffic_labels_str])
-
+    # global label → local label
     df_base_only = df[df['label'].isin(base_traffic_labels_str)].copy()
     df_new_only = df[~df['label'].isin(base_traffic_labels_str)].copy()
     if len(df_base_only) == 0: raise ValueError("No base class data.")
@@ -30,6 +30,7 @@ def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_label
     df_train_decoop, df_base_remaining = train_test_split(df_base_only, test_size=0.3, stratify=df_base_only['label'] if min_samples_base_strat else None, random_state=42) \
         if len(df_base_only) >= 2 else (df_base_only, pd.DataFrame(columns=df.columns))
     
+    # mixed data
     df_mixed_pool = pd.concat([df_base_remaining, df_new_only], ignore_index=True)
     if len(df_mixed_pool) == 0:
         print("Warning: Mixed pool empty. Using DECOOP train data for val/test.")
@@ -42,7 +43,6 @@ def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_label
             if len(df_mixed_pool) >=2 else (df_mixed_pool, df_mixed_pool)
 
     print(f"DECOOP Train: {len(df_train_decoop)}, val: {len(df_val)}, Test: {len(df_test)}")
-    if len(df_train_decoop) == 0: raise ValueError("DECOOP training set empty.")
 
     train_dataset = LLMCSVTrafficDataset(dataset_name, df_train_decoop, tokenizer_for_llm, max_seq_len_for_llm, all_class_labels_global_map, feature_cols, is_training_data=True, base_class_global_indices=base_class_global_indices_sorted)
     val_dataset = LLMCSVTrafficDataset(dataset_name, df_val, tokenizer_for_llm, max_seq_len_for_llm, all_class_labels_global_map, feature_cols, is_training_data=False)
