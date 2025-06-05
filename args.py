@@ -42,6 +42,11 @@ def parameter_parser():
     parser.add_argument('--n_epochs_subclassifier', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=1,
                         help='Number of epochs for Subclassifier training.')
     
+    parser.add_argument('--use_prompt_tuning', dest='USE_PROMPT_TUNING', action='store_true',
+                        help='Enable prompt tuning to reduce trainable parameters.')
+    parser.add_argument('--prompt_tuning_length', dest='PROMPT_TUNING_LENGTH', type=int, default=5,
+                        
+                        help='Number of prompt tokens for prompt tuning.')
     parser.add_argument('--lr_llm', dest='LEARNING_RATE_LLM', type=float, default=1e-5,
                         help='Learning rate for the LLM backbone.')
     parser.add_argument('--lr_head', dest='LEARNING_RATE_HEAD', type=float, default=1e-3,
