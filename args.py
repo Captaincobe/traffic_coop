@@ -20,7 +20,7 @@ def parameter_parser():
                         help='Name of the pre-trained LLM model to use.')
     parser.add_argument('--device', dest='DEVICE', type=str, default="cuda",
                     help='Device to use for training (e.g., "cuda" or "cpu").')
-    parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=8,
+    parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=4,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
     parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=128,
@@ -46,7 +46,7 @@ def parameter_parser():
                         help='Learning rate for the LLM backbone.')
     parser.add_argument('--lr_head', dest='LEARNING_RATE_HEAD', type=float, default=1e-3,
                         help='Learning rate for the classification head.')
-    parser.add_argument('--lr_peft', dest='LEARNING_RATE_PEFT', type=float, default=1e-4,
+    parser.add_argument('--lr_peft', dest='LEARNING_RATE_PEFT', type=float, default=1e-5,
                         help='Learning rate for PEFT parameters if used.')
 
     parser.add_argument('--num_base_classes', dest='NUM_BASE_CLASSES', type=int, default=-1,

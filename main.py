@@ -36,19 +36,13 @@ if __name__ == "__main__":
     
     print(f"Device: {DEVICE}")
     print("Loading and preparing data for LLM...")
-    try:
-        train_dataset, val_dataset, test_dataset, args, _, base_class_indices_num_sorted = load_and_prepare_data_for_llm(
-            args,
-            base_traffic_labels_str,
-            all_class_labels_global_map,
-            tokenizer, # Globally defined tokenizer
-        )
-    except FileNotFoundError:
-        print("ERROR: 'your_traffic_data.csv' not found. Please create a dummy CSV or provide the correct path.")
-        exit()
-    except Exception as e:
-        print(f"Error during data loading: {e}")
-        exit()
+    train_dataset, val_dataset, test_dataset, args, _, base_class_indices_num_sorted = load_and_prepare_data_for_llm(
+        args,
+        base_traffic_labels_str,
+        all_class_labels_global_map,
+        tokenizer, # Globally defined tokenizer
+    )
+
     NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
     NUM_ALL_CLASSES = args.NUM_ALL_CLASSES
     print(f"Input textualized, max_seq_len: {args.MAX_SEQ_LENGTH}")
@@ -56,23 +50,23 @@ if __name__ == "__main__":
     print(f"Total number of unique classes (for output vector): {NUM_ALL_CLASSES}")
     print(f"Base class global indices used for mapping: {base_class_indices_num_sorted}")
 
-    print(f"DECOOP training data size: {len(train_dataset)}")
+    print(f"MODEL training data size: {len(train_dataset)}")
     print(f"Validation data size: {len(val_dataset)}")
     print(f"Test data size: {len(test_dataset)}")
 
     if NUM_BASE_CLASSES <=0 or NUM_ALL_CLASSES <=0:
         raise ValueError("Data loading failed to set global class dimensions properly.")
     if len(train_dataset) == 0:
-        raise ValueError("DECOOP training dataset is empty. Check base class definitions and data.")
+        raise ValueError("MODEL training dataset is empty. Check base class definitions and data.")
 
-    print("\nInitializing and Training LLMTrafficDECOOP model...")
-    decoop_model_instance = LLMTrafficDECOOP(args)
-    decoop_model_instance.set_base_class_global_indices(base_class_indices_num_sorted)
-    decoop_model_instance.fit(train_dataset) # train_dataset uses local labels
+    print("\nInitializing and Training model...")
+    model_instance = LLMTrafficDECOOP(args)
+    model_instance.set_base_class_global_indices(base_class_indices_num_sorted) # check baseclass
+    model_instance.fit(train_dataset) # train_dataset uses local labels
     print("LLMTrafficDECOOP Model Training Finished.")
     # 使用验证集校准 ECI 阈值
     base_class_set_for_calibration = set(base_class_indices_num_sorted)
-    decoop_model_instance.calibrate_eci_threshold(val_dataset, base_class_set_for_calibration)
+    model_instance.calibrate_eci_threshold(val_dataset, base_class_set_for_calibration)
     
     # --- Conformal Prediction Validation (uses global labels) ---
     print("\nStarting Conformal Prediction Validation...")
@@ -85,7 +79,7 @@ if __name__ == "__main__":
             tokenized_input_dict = val_dataset[i] # Dataset __getitem__ returns dict
             y_c_true_global_numerical = tokenized_input_dict['global_labels'].item() # Get global label
             
-            probas_x_c_all_classes = decoop_model_instance.predict_proba(tokenized_input_dict) 
+            probas_x_c_all_classes = model_instance.predict_proba(tokenized_input_dict) 
             
             if 0 <= y_c_true_global_numerical < len(probas_x_c_all_classes):
                  prob_true_label = probas_x_c_all_classes[y_c_true_global_numerical]
@@ -116,7 +110,7 @@ if __name__ == "__main__":
             tokenized_input_dict = test_dataset[i]
             # y_t_true_global_numerical = tokenized_input_dict['global_labels'].item() # Already got all true labels
 
-            probas_all_classes = decoop_model_instance.predict_proba(tokenized_input_dict)
+            probas_all_classes = model_instance.predict_proba(tokenized_input_dict)
             decoop_probability_scores_for_all_classes[i, :] = probas_all_classes
             predicted_global_class_idx = np.argmax(probas_all_classes)
             decoop_point_predictions_global_numerical.append(predicted_global_class_idx)
