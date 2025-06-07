@@ -14,7 +14,9 @@ class SharedEncoderClassifier(nn.Module):
         self.encoder = shared_encoder
         self.classifier = nn.Linear(hidden_dim, num_classes).to(torch.float32)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, cls_token=None):
+        if cls_token is not None:
+            return self.classifier(cls_token)
         if inputs_embeds is not None:
             output = self.encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         else:
@@ -153,31 +155,61 @@ class LLMTrafficDECOOP(nn.Module):
     def set_base_class_global_indices(self, base_class_global_indices):
         self.base_class_global_indices = base_class_global_indices
 
-    def fit(self, train_dataset):
+    def fit(self, train_dataset, k):
         from torch.utils.data import DataLoader
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
+        self.pseudo_ood_classes = getattr(self, "pseudo_ood_classes", {})
+        label_set = set()
+        for sample in train_dataset:
+            label_set.add(sample['labels'].item())
+        self.pseudo_ood_classes[k] = label_set
+
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        # print(f"\n[Training PromptLearner OOD #{k}]")
+        optimizer = torch.optim.Adam(self.prompt_manager.get_all_ood_parameters(), lr=learning_rate)
+        loss_fn = nn.CrossEntropyLoss()
 
-        # 训练第 k=0 个 detector 分支
-        for k in range(self.k_detectors):
-            print(f"\n[Training PromptLearner OOD #{k}]")
-            optimizer = torch.optim.Adam(self.prompt_manager.get_all_ood_parameters(), lr=learning_rate)
-            loss_fn = nn.CrossEntropyLoss()
+        def model_forward(input_ids, attention_mask):
+            return self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
 
-            def model_forward(input_ids, attention_mask):
-                return self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
+        self.prompt_manager.train()
+        for epoch in range(self.args.N_EPOCHS_DETECTOR):
+            total_loss = 0
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
 
-            train_prompt_learner(
-                model=self.prompt_manager,
-                forward_fn=model_forward,
-                dataloader=dataloader,
-                optimizer=optimizer,
-                loss_fn=loss_fn,
-                max_epochs=self.args.N_EPOCHS_DETECTOR,
-                device=self.device
-            )
+                logits = model_forward(input_ids=input_ids, attention_mask=attention_mask)
+                probs = softmax(logits, dim=1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+
+                is_ood = torch.tensor([y.item() in self.pseudo_ood_classes[k] for y in labels], device=self.device)
+                is_id = ~is_ood
+
+                if is_id.any():
+                    loss_id = cross_entropy(logits[is_id], labels[is_id])
+                else:
+                    loss_id = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+                if is_ood.any() and is_id.any():
+                    entropy_id = entropy[is_id].mean()
+                    entropy_ood = entropy[is_ood].mean()
+                    loss_margin = torch.clamp(self.args.OOD_MARGIN + entropy_id - entropy_ood, min=0.0)
+                else:
+                    loss_margin = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+                loss = loss_id + self.args.LAMBDA_ENTROPY * loss_margin
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.prompt_manager.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.N_EPOCHS_DETECTOR}] Loss: {total_loss/len(dataloader):.4f}")
     
     def fit_sub_classifiers(self, train_dataset, threshold_tau):
         from torch.utils.data import DataLoader
@@ -185,6 +217,8 @@ class LLMTrafficDECOOP(nn.Module):
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+        self.shared_encoder.eval()
 
         for k in range(self.k_detectors):
             print(f"\n[Training Sub-classifier + COOP Prompt #{k}]")
@@ -194,7 +228,7 @@ class LLMTrafficDECOOP(nn.Module):
                 lr=learning_rate
             )
 
-            for epoch in range(self.args.N_EPOCHS_COOP):
+            for epoch in range(self.args.N_EPOCHS_SUBCLASSIFIER):
                 total_loss = 0
                 self.train()
                 for batch in dataloader:
@@ -208,18 +242,20 @@ class LLMTrafficDECOOP(nn.Module):
                         entropy = -torch.sum(probs_ood * torch.log(probs_ood + 1e-8), dim=1)
                         is_id = entropy <= threshold_tau
 
-                    logits_coop = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
-                    logits_sub = self.sub_classifiers_[k](input_ids=input_ids, attention_mask=attention_mask)
+                    with torch.no_grad():
+                        outputs = self.shared_encoder(input_ids=input_ids, attention_mask=attention_mask)
+                        cls_token = outputs.last_hidden_state[:, 0]
+                    logits_sub = self.sub_classifiers_[k].classifier(cls_token)
 
                     with torch.no_grad():
-                        logits_zs = self.zs_classifier_(input_ids=input_ids, attention_mask=attention_mask)
+                        logits_zs = self.zs_classifier_.classifier(cls_token)
 
                     loss = 0.0
                     if is_id.any():
                         loss_id = cross_entropy(logits_sub[is_id], labels[is_id])
                         loss += loss_id
                     if (~is_id).any():
-                        loss_kl = kl_divergence_loss_from_logits(logits_coop[~is_id], logits_zs[~is_id])
+                        loss_kl = kl_divergence_loss_from_logits(logits_sub[~is_id], logits_zs[~is_id])
                         loss += self.args.KL_COEFF * loss_kl
 
                     optimizer.zero_grad()
@@ -227,7 +263,7 @@ class LLMTrafficDECOOP(nn.Module):
                     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                     optimizer.step()
                     total_loss += loss.item()
-                print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_COOP}] Total Loss: {total_loss/len(dataloader):.4f}")
+                print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Total Loss: {total_loss/len(dataloader):.4f}")
 
     def predict_proba(self, tokenized_sample):
         self.eval()
@@ -240,19 +276,6 @@ class LLMTrafficDECOOP(nn.Module):
         return probs.cpu().numpy().squeeze()
 
 
-class ECIBasedOODDetector:
-    def __init__(self, alpha=0.1, eta=0.01, init_q=0.9):
-        self.q_t = init_q
-        self.alpha = alpha
-        self.eta = eta
-
-    def update_threshold(self, s_x):
-        indicator = 1 if s_x > self.q_t else 0
-        self.q_t -= self.eta * (indicator - self.alpha)
-        self.q_t = max(0.0, min(1.0, self.q_t))  # 保证在 [0, 1] 区间
-
-    def is_ood(self, s_x):
-        return s_x > self.q_t
 
 
 class DECOOPInferenceEngine:
@@ -276,7 +299,7 @@ class DECOOPInferenceEngine:
             max_k = detector_scores.index(max_score)
             eci = self.eci_thresholds[max_k]
 
-            if eci.is_ood(max_score):
+            if max_score > self.model.args.CP_OOD_THRESHOLD:
                 zs_logits = self.model.zs_classifier_(input_ids=input_ids, attention_mask=attention_mask)
                 probs = softmax(zs_logits, dim=1)
                 return "OOD", probs.cpu().numpy().squeeze()
@@ -286,12 +309,4 @@ class DECOOPInferenceEngine:
                 return "ID", probs.cpu().numpy().squeeze()
 
     def update_thresholds(self, tokenized_sample):
-        input_ids = tokenized_sample["input_ids"].unsqueeze(0).to(self.model.device)
-        attention_mask = tokenized_sample["attention_mask"].unsqueeze(0).to(self.model.device)
-
-        with torch.no_grad():
-            for k in range(self.model.k_detectors):
-                logits = self.model.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-                probs = softmax(logits, dim=1)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-                self.eci_thresholds[k].update_threshold(entropy.item())
+        pass

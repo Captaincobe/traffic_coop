@@ -20,7 +20,7 @@ def parameter_parser():
                         help='Name of the pre-trained LLM model to use.')
     parser.add_argument('--device', dest='DEVICE', type=str, default="cuda",
                     help='Device to use for training (e.g., "cuda" or "cpu").')
-    parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=512,
+    parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
     parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=64,
@@ -32,12 +32,15 @@ def parameter_parser():
     parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
                         help='Number of detectors per DECOOP paper (often K=3).')
     
-    parser.add_argument('--gamma_ood_loss', dest='GAMMA_OOD_LOSS', type=float, default=0.4,
+    parser.add_argument('--lambda', dest='LAMBDA_ENTROPY', type=float, default=0.4,
                         help='Gamma parameter for OOD loss.')
-    
+    parser.add_argument('--margin', dest='OOD_MARGIN', type=float, default=0.4,
+                    help='Gamma parameter for OOD loss.')
+    parser.add_argument('--kl', dest='KL_COEFF', type=float, default=0.4)
+
     parser.add_argument('--n_epochs_zs_classifier', dest='N_EPOCHS_ZS_CLASSIFIER', type=int, default=1,
                         help='Number of epochs for Zero-Shot Classifier training.')
-    parser.add_argument('--n_epochs_detector', dest='N_EPOCHS_DETECTOR', type=int, default=10,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=1,
                         help='Number of epochs for Detector training.')
     parser.add_argument('--n_epochs_subclassifier', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=1,
                         help='Number of epochs for Subclassifier training.')

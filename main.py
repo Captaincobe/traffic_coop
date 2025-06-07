@@ -5,10 +5,15 @@ from sklearn.preprocessing import label_binarize
 import torchvision
 import torch
 
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+
 from args import parameter_parser
-from models.model import DECOOPInferenceEngine, ECIBasedOODDetector, LLMTrafficDECOOP
+from models.model import DECOOPInferenceEngine, LLMTrafficDECOOP
 from utils.load_data import load_and_prepare_data_for_llm
 torchvision.disable_beta_transforms_warning()
+from collections import defaultdict
+from sklearn.model_selection import KFold
 
 args = parameter_parser()
 LLM_MODEL_NAME = args.LLM_MODEL_NAME
@@ -41,7 +46,78 @@ print(f"Base class global indices: {base_class_indices_num_sorted}")
 print("\nInitializing and Training model...")
 model_instance = LLMTrafficDECOOP(args)
 model_instance.set_base_class_global_indices(base_class_indices_num_sorted)
-model_instance.fit(train_dataset)
+
+
+# K-fold leave-one-class-out split for pseudo-OOD estimation
+kf = KFold(n_splits=args.K_DETECTORS, shuffle=True, random_state=42)
+base_class_to_indices = defaultdict(list)
+for idx, sample in enumerate(train_dataset):
+    y = sample['global_labels'].item()
+    if y in base_class_indices_num_sorted:
+        base_class_to_indices[y].append(idx)
+
+base_class_indices = sorted(base_class_to_indices.keys())
+splits = list(kf.split(base_class_indices))
+
+# For collecting entropy scores for CP
+non_conformity_scores_val = []
+
+
+for k, (train_class_idx, val_class_idx) in enumerate(splits):
+    train_ids, val_ids = [], []
+    for i in train_class_idx:
+        train_ids.extend(base_class_to_indices[base_class_indices[i]])
+    for j in val_class_idx:
+        val_ids.extend(base_class_to_indices[base_class_indices[j]])
+
+    train_subset = torch.utils.data.Subset(train_dataset, train_ids)
+    val_subset = torch.utils.data.Subset(train_dataset, val_ids)
+
+    print(f"\n[Training PromptLearner OOD #{k}] with {len(train_ids)} ID and {len(val_ids)} pseudo-OOD samples")
+    # Prompt tuning training procedure
+    train_loader = DataLoader(train_subset, batch_size=args.BATCH_SIZE, shuffle=True)
+    prompt_params = list(model_instance.prompt_manager.ood_prompts[k].parameters())
+    optimizer = torch.optim.Adam(prompt_params, lr=args.LEARNING_RATE_PROMPT)
+
+    model_instance.prompt_manager.encoder.eval()  # Freeze encoder
+    model_instance.prompt_manager.ood_prompts[k].train()
+
+    for epoch in range(args.NUM_EPOCHS):
+        total_loss = 0
+        for batch_idx, batch in enumerate(train_loader):
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            # 将全局 label 映射为当前 fold 的局部 label
+            train_class_global_labels = [base_class_indices_num_sorted[i] for i in train_class_idx]
+            global_to_local = {g: i for i, g in enumerate(train_class_global_labels)}
+            labels = batch['global_labels'].tolist()
+            labels = [global_to_local[l] for l in labels]
+            labels = torch.tensor(labels).to(DEVICE)
+
+            logits = model_instance.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
+            loss = F.cross_entropy(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+            if batch_idx % 10 == 0:
+                print(f"[PromptTuning][Epoch {epoch+1}] Batch {batch_idx} | Loss: {loss.item():.4f}")
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"[PromptTuning][Epoch {epoch+1}/{args.NUM_EPOCHS}] Average Loss: {avg_loss:.4f}")
+
+    # Evaluate entropy on val_subset to collect for CP
+    for sample in val_subset:
+        input_ids = sample["input_ids"].unsqueeze(0).to(DEVICE)
+        attention_mask = sample["attention_mask"].unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            logits = model_instance.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
+            probs = torch.nn.functional.softmax(logits, dim=1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).item()
+            non_conformity_scores_val.append(entropy)
+
 # 估计 entropy 阈值 τ，可以使用 validation set 平均 entropy
 # 示例：固定阈值
 tau_entropy = 1.2  # 可调参数
@@ -76,6 +152,8 @@ else:
     n_val = len(non_conformity_scores_val)
     q_level = np.ceil((n_val + 1) * (1 - ALPHA_CP)) / n_val
     q_hat = np.quantile(non_conformity_scores_val, q_level) if n_val > 0 else 0.9
+
+args.CP_OOD_THRESHOLD = q_hat
 
 print(f"Validation complete. q_hat = {q_hat:.4f}")
 
@@ -151,15 +229,4 @@ try:
 except Exception as e:
     print(f"AUROC error: {e}")
 
-# 初始化 ECI 阈值管理器
-eci_thresholds = [ECIBasedOODDetector(alpha=0.1, eta=0.01) for _ in range(args.K_DETECTORS)]
-engine = DECOOPInferenceEngine(model_instance, eci_thresholds)
-
-# 更新阈值（可选） - 基于 val 数据集
-for sample in val_dataset:
-    engine.update_thresholds(sample)
-
-# 推理并判断是否为 OOD
-for sample in test_dataset:
-    label_type, probs = engine.predict(sample)
-    print(f"[{label_type}] Predicted probabilities: {probs}")
+engine = DECOOPInferenceEngine(model_instance, eci_thresholds=None)
