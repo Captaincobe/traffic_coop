@@ -1,29 +1,24 @@
+from collections import defaultdict
 import numpy as np
-from transformers import AutoTokenizer
 from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import label_binarize
-import torchvision
 import torch
-
-from torch.utils.data import DataLoader
-import torch.nn.functional as F
-
+import torchvision
 from args import parameter_parser
 from models.model import DECOOPInferenceEngine, LLMTrafficDECOOP
 from utils.load_data import load_and_prepare_data_for_llm
 torchvision.disable_beta_transforms_warning()
-from collections import defaultdict
-from sklearn.model_selection import KFold
 
 args = parameter_parser()
-LLM_MODEL_NAME = args.LLM_MODEL_NAME
+# LLM_MODEL_NAME = args.LLM_MODEL_NAME
 DEVICE = args.DEVICE
 NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
 NUM_ALL_CLASSES = args.NUM_ALL_CLASSES
 ALPHA_CP = args.ALPHA_CP
 dataset_name = args.dataset_name
 
-tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+# tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
 
 if dataset_name == "ISCXVPN2016":
     base_traffic_labels_str = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "VPN-P2P"]
@@ -33,9 +28,10 @@ all_labels_list = sorted(list(set(base_traffic_labels_str + new_traffic_labels_s
 all_class_labels_global_map = {label: i for i, label in enumerate(all_labels_list)}
 
 print(f"Device: {DEVICE}")
-train_dataset, val_dataset, test_dataset, args, _, base_class_indices_num_sorted = load_and_prepare_data_for_llm(
-    args, base_traffic_labels_str, all_class_labels_global_map, tokenizer
-)
+
+train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = load_and_prepare_data_for_llm(
+    args, base_traffic_labels_str, all_class_labels_global_map)
+
 
 NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
 NUM_ALL_CLASSES = args.NUM_ALL_CLASSES
@@ -74,49 +70,11 @@ for k, (train_class_idx, val_class_idx) in enumerate(splits):
     val_subset = torch.utils.data.Subset(train_dataset, val_ids)
 
     print(f"\n[Training PromptLearner OOD #{k}] with {len(train_ids)} ID and {len(val_ids)} pseudo-OOD samples")
-    # Prompt tuning training procedure
-    train_loader = DataLoader(train_subset, batch_size=args.BATCH_SIZE, shuffle=True)
-    prompt_params = list(model_instance.prompt_manager.ood_prompts[k].parameters())
-    optimizer = torch.optim.Adam(prompt_params, lr=args.LEARNING_RATE_PROMPT)
+    # Use built-in fit method with entropy-margin learning on pseudo-OOD
+    model_instance.fit(train_subset, k=k)
 
-    model_instance.prompt_manager.encoder.eval()  # Freeze encoder
-    model_instance.prompt_manager.ood_prompts[k].train()
-
-    for epoch in range(args.NUM_EPOCHS):
-        total_loss = 0
-        for batch_idx, batch in enumerate(train_loader):
-            input_ids = batch['input_ids'].to(DEVICE)
-            attention_mask = batch['attention_mask'].to(DEVICE)
-            # 将全局 label 映射为当前 fold 的局部 label
-            train_class_global_labels = [base_class_indices_num_sorted[i] for i in train_class_idx]
-            global_to_local = {g: i for i, g in enumerate(train_class_global_labels)}
-            labels = batch['global_labels'].tolist()
-            labels = [global_to_local[l] for l in labels]
-            labels = torch.tensor(labels).to(DEVICE)
-
-            logits = model_instance.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-            loss = F.cross_entropy(logits, labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-            if batch_idx % 10 == 0:
-                print(f"[PromptTuning][Epoch {epoch+1}] Batch {batch_idx} | Loss: {loss.item():.4f}")
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"[PromptTuning][Epoch {epoch+1}/{args.NUM_EPOCHS}] Average Loss: {avg_loss:.4f}")
-
-    # Evaluate entropy on val_subset to collect for CP
-    for sample in val_subset:
-        input_ids = sample["input_ids"].unsqueeze(0).to(DEVICE)
-        attention_mask = sample["attention_mask"].unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            logits = model_instance.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-            probs = torch.nn.functional.softmax(logits, dim=1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).item()
-            non_conformity_scores_val.append(entropy)
+    model_instance.collect_cp_entropy(val_subset, k=k)
+    model_instance.eci_calibration(val_subset, k=k, alpha=ALPHA_CP)
 
 # 估计 entropy 阈值 τ，可以使用 validation set 平均 entropy
 # 示例：固定阈值
@@ -124,6 +82,7 @@ tau_entropy = 1.2  # 可调参数
 
 model_instance.fit_sub_classifiers(train_dataset, threshold_tau=tau_entropy)
 print("LLMTrafficDECOOP Model Training Finished.")
+engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
 
 # ----------------- Conformal Calibration -----------------
 print("\nStarting Conformal Prediction Validation...")
@@ -140,7 +99,7 @@ else:
         y_global = sample['global_labels'].item()
         if y_global not in base_class_set:
             continue
-        probas = model_instance.predict_proba(sample)
+        _, probas = engine.predict(sample)
         try:
             idx = base_class_list.index(y_global)
             score = 1.0 - probas[idx]
@@ -166,7 +125,7 @@ predictions_conformal_sets = []
 
 for i in range(len(test_dataset)):
     sample = test_dataset[i]
-    probas = model_instance.predict_proba(sample)
+    _, probas = engine.predict(sample)
     base_class_list_sorted = base_class_list
 
     # argmax over base classes → map to global index
@@ -229,4 +188,3 @@ try:
 except Exception as e:
     print(f"AUROC error: {e}")
 
-engine = DECOOPInferenceEngine(model_instance, eci_thresholds=None)

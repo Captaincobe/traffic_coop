@@ -23,11 +23,13 @@ def parameter_parser():
     parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
-    parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=64,
+    parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=128,
                     help='Maximum sequence length for LLM input.')
     
     parser.add_argument('--alpha_cp', dest='ALPHA_CP', type=float, default=0.1,
                         help='Alpha parameter for confidence penalty.')
+    
+    parser.add_argument('--cp_ood', dest='CP_OOD_THRESHOLD', type=float, default=0.1)
     
     parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
                         help='Number of detectors per DECOOP paper (often K=3).')
@@ -38,17 +40,17 @@ def parameter_parser():
                     help='Gamma parameter for OOD loss.')
     parser.add_argument('--kl', dest='KL_COEFF', type=float, default=0.4)
 
-    parser.add_argument('--n_epochs_zs_classifier', dest='N_EPOCHS_ZS_CLASSIFIER', type=int, default=1,
-                        help='Number of epochs for Zero-Shot Classifier training.')
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=1,
+    # parser.add_argument('--n_epochs_zs_classifier', dest='N_EPOCHS_ZS_CLASSIFIER', type=int, default=1,
+    #                     help='Number of epochs for Zero-Shot Classifier training.')
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=50,
                         help='Number of epochs for Detector training.')
-    parser.add_argument('--n_epochs_subclassifier', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=1,
+    parser.add_argument('--n_epochs_subclassifier', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=50,
                         help='Number of epochs for Subclassifier training.')
     
-    parser.add_argument('--use_prompt_tuning', dest='USE_PROMPT_TUNING', action='store_true',
-                        help='Enable prompt tuning to reduce trainable parameters.')
-    parser.add_argument('--prompt_tuning_length', dest='PROMPT_TUNING_LENGTH', type=int, default=5,
-                        help='Number of prompt tokens for prompt tuning.')
+    # parser.add_argument('--use_prompt_tuning', dest='USE_PROMPT_TUNING', action='store_true',
+    #                     help='Enable prompt tuning to reduce trainable parameters.')
+    # parser.add_argument('--prompt_tuning_length', dest='PROMPT_TUNING_LENGTH', type=int, default=5,
+    #                     help='Number of prompt tokens for prompt tuning.')
     parser.add_argument('--weight_decay', dest='WEIGHT_DECAY', type=float, default=5e-4,
                     help='Weight decay (L2 loss on parameters).')
     # parser.add_argument('--lr_llm', dest='LEARNING_RATE_LLM', type=float, default=1e-6,
@@ -63,8 +65,8 @@ def parameter_parser():
     parser.add_argument('--num_all_classes', dest='NUM_ALL_CLASSES', type=int, default=-1,
                         help='Total number of all classes. Set to -1 to be determined dynamically.')
 
-    parser.add_argument('--ood_threshold_placeholder', dest='OOD_THRESHOLD_PLACEHOLDER', type=float, default=0.5,
-                        help='Placeholder for OOD threshold; DECOOP typically uses Otsu method.')
+    # parser.add_argument('--ood_threshold_placeholder', dest='OOD_THRESHOLD_PLACEHOLDER', type=float, default=0.5,
+    #                     help='Placeholder for OOD threshold; DECOOP typically uses Otsu method.')
 
     args = parser.parse_args()
 
