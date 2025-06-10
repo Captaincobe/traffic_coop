@@ -7,6 +7,8 @@ from transformers import AutoTokenizer
 from utils.Dataloader import LLMCSVTrafficDataset
 
 
+
+
 # --- 1. Data Loading and Preprocessing (Using implementations from previous responses) ---
 def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_labels_global_map):
     max_seq_len_for_llm = args.MAX_SEQ_LENGTH
@@ -20,7 +22,8 @@ def load_and_prepare_data_for_llm(args, base_traffic_labels_str, all_class_label
         train_dataset = cached["train"]
         val_dataset = cached["val"]
         test_dataset = cached["test"]
-        args = cached["args"]
+        args.NUM_BASE_CLASSES = cached["args"].NUM_BASE_CLASSES
+        args.NUM_ALL_CLASSES = cached["args"].NUM_ALL_CLASSES
         base_class_global_indices_sorted = cached["base_class_indices"]
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.LLM_MODEL_NAME)
