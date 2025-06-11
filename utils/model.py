@@ -285,19 +285,25 @@ class LLMTrafficDECOOP(nn.Module):
             for batch in dataloader:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
-                labels = batch["labels"].to(self.device)
+                # 正确获取全局标签！
+                global_labels = batch["global_labels"].to(self.device) # <--- 修正：使用 batch["global_labels"]
 
                 logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
                 probs = softmax(logits, dim=1)
 
-                for i in range(len(labels)):
-                    label_global = labels[i].item()
+                # 遍历批次中的每个样本
+                for i in range(len(global_labels)): # <--- 修正：遍历 global_labels
+                    current_global_label = global_labels[i].item() # <--- 获取当前样本的正确全局标签
                     prob = probs[i].detach().cpu().numpy()
                     pred = np.argmax(prob)
                     score = 1.0 - prob[pred]  # non-conformity score: 1 - max prob
-                    if label_global not in self.base_global_set:
+
+                    # 正确的判断：如果当前全局标签不在当前检测器的 base_global_set 中，则跳过
+                    if current_global_label not in self.base_global_set: # <--- 修正：用正确的全局标签进行判断
                         continue  # 非基类直接跳过
-                    label_base = self.global2base[label_global]
+                    
+                    # 正确的映射：将全局标签映射到局部基类索引
+                    label_base = self.global2base[current_global_label] # <--- 修正：用正确的全局标签进行映射
                     scores_per_class[label_base].append(score)
 
         # Compute quantile thresholds per class, with warnings and debug info
