@@ -8,7 +8,7 @@ from utils.Dataloader import LLMCSVTrafficDataset, convert_feature_to_prompt_tex
 
 
 # --- 1. Data Loading and Preprocessing (Using implementations from previous responses) ---
-def load_data(args, full_traffic_labels_list, all_class_labels_global_map, ood_labels_to_exclude=None):
+def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_labels_to_exclude=None):
     max_seq_len_for_llm = args.MAX_SEQ_LENGTH
     dataset_name = args.dataset_name
 

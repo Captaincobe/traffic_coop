@@ -1,6 +1,6 @@
 import os
 import torch
-from utils import load_data
+from utils.load_data import loadData
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
@@ -29,7 +29,7 @@ all_class_labels_global_map = {label: i for i, label in enumerate(all_labels_lis
 
 print(f"Device: {DEVICE}")
 
-train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = load_data(
+train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = loadData(
     args, base_traffic_labels_str, all_class_labels_global_map, ood_labels_to_exclude=ood_labels_for_this_run)
 
 

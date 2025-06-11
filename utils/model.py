@@ -317,11 +317,9 @@ class LLMTrafficDECOOP(nn.Module):
                 scores_np = np.array(scores)
                 n_val = len(scores_np)
                 q_level = np.ceil((n_val + 1) * (1 - alpha)) / n_val
-                # Defensive fallback: if score distribution is too narrow, warn
                 min_score, max_score = scores_np.min(), scores_np.max()
                 if np.allclose(min_score, max_score, atol=1e-3) and max_score > 0.95:
                     print(f"[ECII] Warning: class {cls} score distribution is very narrow (min={min_score:.4f}, max={max_score:.4f})")
-                # Compute quantile, fallback if needed
                 try:
                     thresh = float(np.quantile(scores_np, q_level))
                 except Exception:
