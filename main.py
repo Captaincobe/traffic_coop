@@ -1,5 +1,6 @@
 import os
 import torch
+from torch.utils.data import DataLoader
 from utils.load_data import loadData
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -107,63 +108,17 @@ if __name__ == "__main__":
     engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
 
     print("\nStarting Conformal Prediction Validation...")
-    base_class_set = set(base_class_indices_num_sorted)
-    base_class_list = sorted(list(base_class_set))
-    non_conformity_scores_val = []
 
-    if len(val_dataset) == 0:
-        print("Validation set empty, fallback q_hat used.")
-        q_hat = 0.9
-    else:
-        for i in range(len(val_dataset)):
-            sample = val_dataset[i]
-            y_global = sample['global_labels'].item()
-            if y_global not in base_class_set:
-                continue
-            _, probas = engine.predict(sample)
-            try:
-                idx = base_class_list.index(y_global)
-                score = 1.0 - probas[idx]
-            except Exception:
-                score = 1.0
-            non_conformity_scores_val.append(score)
+    # 调用 engine 的 calibrate_q_hat 方法进行校准
+    engine.calibrate_q_hat(val_dataset, args.ALPHA_CP)
 
-        non_conformity_scores_val = np.array(non_conformity_scores_val)
-        n_val = len(non_conformity_scores_val)
-        q_level = np.ceil((n_val + 1) * (1 - ALPHA_CP)) / n_val
-        q_hat = np.quantile(non_conformity_scores_val, q_level) if n_val > 0 else 0.9
+    # 获取测试集预测结果
+    point_preds_global, prob_matrix_all_classes, predictions_conformal_sets = \
+        engine.predict_batch(test_dataset)
 
-    args.CP_OOD_THRESHOLD = q_hat
+    # 从 test_dataset 中预先提取所有真实标签，用于最终评估
+    y_test_true_global = np.array([s['global_labels'].item() for s in test_dataset]) 
 
-    print(f"Validation complete. q_hat = {q_hat:.4f}")
-
-    # ----------------- Prediction on Test Set -----------------
-    print("\nPredicting on test set with Conformal Prediction...")
-    y_test_true_global = np.array([s['global_labels'].item() for s in test_dataset])
-    point_preds_global = []
-    prob_matrix_all_classes = np.zeros((len(test_dataset), NUM_ALL_CLASSES))
-    predictions_conformal_sets = []
-
-    for i in range(len(test_dataset)):
-        sample = test_dataset[i]
-        _, probas = engine.predict(sample)
-        base_class_list_sorted = base_class_list
-
-        # argmax over base classes → map to global index
-        pred_base_idx = np.argmax(probas)
-        pred_global_idx = base_class_list_sorted[pred_base_idx] if pred_base_idx < len(base_class_list_sorted) else -1
-        point_preds_global.append(pred_global_idx)
-
-        # fill prob vector
-        for j, global_idx in enumerate(base_class_list_sorted):
-            prob_matrix_all_classes[i, global_idx] = probas[j]
-
-        # conformal prediction set
-        cp_set = []
-        for j, global_idx in enumerate(base_class_list_sorted):
-            if 1.0 - probas[j] <= q_hat:
-                cp_set.append(global_idx)
-        predictions_conformal_sets.append(cp_set)
 
     # ----------------- Evaluatfion -----------------
     print("\nEvaluating Conformal Prediction...")

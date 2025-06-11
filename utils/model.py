@@ -189,19 +189,50 @@ class PromptLearnerManager(nn.Module):
         cls = outputs.last_hidden_state[:,0]                             # (B·K,H)
         logits = self.classifier(cls).view(K, B, -1).permute(1,2,0)      # (B,C,K)
         return logits
+    
+    def forward_coop_batch(self, input_ids, attention_mask):
+        """
+        批量计算所有 K 个 COOP Prompt 和分类器的 logits。
+        input_ids:  (B, L)
+        返回 logits: (B, C, K) - 其中 B 是批量大小，C 是类别数，K 是检测器数量
+        """
+        K = self.K 
+        B, L = input_ids.shape
+        
+        # 堆叠所有 K 个 COOP Prompt 的嵌入，并将其扩展到批量大小
+        prompt_bank = torch.stack([p.ln(p.prompt_embedding)
+                                for p in self.coop_prompts])   # (K,Lp,H)
+        prompt_bank = prompt_bank.unsqueeze(1).expand(-1, B, -1, -1)     # (K,B,Lp,H)
+        prompt_bank = prompt_bank.reshape(B*K, self.prompt_length, -1)   # (B·K,Lp,H)
+
+        # 编码器部分通常是冻结的，所以可以使用 no_grad
+        with torch.no_grad():
+            tok_embeds = self.encoder.embeddings(input_ids)              # (B,L,H)
+        tok_embeds = tok_embeds.unsqueeze(0).expand(K, -1, -1, -1)       # (K,B,L,H)
+        tok_embeds = tok_embeds.reshape(B*K, L, -1)                      # (B·K,L,H)
+
+        # 拼接 Prompt 嵌入和 Token 嵌入
+        full_embeds = torch.cat([prompt_bank, tok_embeds], 1)            # (B·K,L+Lp,H)
+
+        # 构造完整的注意力掩码
+        full_mask = torch.cat([
+            torch.ones(B*K, self.prompt_length, dtype=attention_mask.dtype, device=self.device),
+            attention_mask.unsqueeze(0).expand(K, -1, -1).reshape(B*K, L)
+        ], 1)
+
+        # 通过编码器获取输出
+        outputs = self.encoder(inputs_embeds=full_embeds, attention_mask=full_mask)
+        cls = outputs.last_hidden_state[:,0]                             # (B·K,H)
+        # 通过分类器获取 logits，并重新塑形为 (B, C, K)
+        logits = self.classifier(cls).view(K, B, -1).permute(1,2,0)      # (B,C,K)
+        return logits
     def forward_ood(self, k, input_ids, attention_mask):
         return self._forward_with_prompt(self.ood_prompts[k], input_ids, attention_mask)
 
     def forward_coop(self, k, input_ids, attention_mask):
         return self._forward_with_prompt(self.coop_prompts[k], input_ids, attention_mask)
 
-    # def get_all_ood_parameters(self):
-    #     return list(self.ood_prompts.parameters()) + list(self.classifier.parameters())
-
-    # def get_all_coop_parameters(self):
-    #     return list(self.coop_prompts.parameters()) + list(self.classifier.parameters())
-
-    # ---- New helper: return only parameters for the k‑th prompt ----
+    # ---- return only parameters for the k‑th prompt ----
     def get_ood_parameters_k(self, k: int):
         return list(self.ood_prompts[k].parameters()) + list(self.classifier.parameters())
 
@@ -267,43 +298,45 @@ class LLMTrafficDECOOP(nn.Module):
 
 
     def set_base_class_global_indices(self, base_class_global_indices):
-        # 全局索引（如 1,2,3,4,5,7,9,10,12,13）→ 排序
         self.base_class_global_indices = sorted(base_class_global_indices)
-        # 快速判别集合
         self.base_global_set = set(self.base_class_global_indices)
-        # 建立全局 idx → 基类相对 idx（0…NUM_BASE_CLASSES-1）
         self.global2base = {g: i for i, g in enumerate(self.base_class_global_indices)}
 
     def eci_calibration(self, calibration_dataset, k, alpha=0.1):
         dataloader = DataLoader(calibration_dataset, batch_size=self.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=4)
 
         self.eval()
-        scores_per_class = {i: [] for i in range(self.num_base_classes)}
+        # scores_per_class = {i: [] for i in range(self.num_base_classes)}
+        # 修正：scores_per_class 应该只为当前检测器实际会产生分数的局部索引进行初始化。
+        # 这些局部索引是 self.global2base 的值域，也就是 0 到 len(self.base_global_set) - 1。
+        scores_per_class = {local_idx: [] for local_idx in self.global2base.values()}
 
-        # Collect per-class non-conformity scores with debug output
+        # --- debug ---
+        # print(f"\n[DEBUG ECII] Detector {k} calibration started.")
+        # print(f"[DEBUG ECII] Detector {k}'s current self.base_global_set (ID global indices): {self.base_global_set}")
+        # print(f"[DEBUG ECII] Detector {k}'s current self.global2base: {self.global2base}")
+        # print(f"[DEBUG ECII] Expecting scores for Local Base Index 12 (Global Class 13). Is Global 13 in self.base_global_set? {13 in self.base_global_set}")
+        # -----------------------------------------------------------
+
         with torch.no_grad():
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
-                # 正确获取全局标签！
-                global_labels = batch["global_labels"].to(self.device) # <--- 修正：使用 batch["global_labels"]
+                global_labels = batch["global_labels"].to(self.device)
 
                 logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
                 probs = softmax(logits, dim=1)
 
-                # 遍历批次中的每个样本
-                for i in range(len(global_labels)): # <--- 修正：遍历 global_labels
-                    current_global_label = global_labels[i].item() # <--- 获取当前样本的正确全局标签
+                for i in range(len(global_labels)):
+                    current_global_label = global_labels[i].item()
                     prob = probs[i].detach().cpu().numpy()
                     pred = np.argmax(prob)
                     score = 1.0 - prob[pred]  # non-conformity score: 1 - max prob
 
-                    # 正确的判断：如果当前全局标签不在当前检测器的 base_global_set 中，则跳过
-                    if current_global_label not in self.base_global_set: # <--- 修正：用正确的全局标签进行判断
+                    if current_global_label not in self.base_global_set:
                         continue  # 非基类直接跳过
                     
-                    # 正确的映射：将全局标签映射到局部基类索引
-                    label_base = self.global2base[current_global_label] # <--- 修正：用正确的全局标签进行映射
+                    label_base = self.global2base[current_global_label]
                     scores_per_class[label_base].append(score)
 
         # Compute quantile thresholds per class, with warnings and debug info
@@ -400,7 +433,7 @@ class LLMTrafficDECOOP(nn.Module):
     
     def fit_sub_classifiers(self, train_dataset):
         batch_size = self.args.BATCH_SIZE
-        learning_rate = self.args.LEARNING_RATE_PROMPT
+        learning_rate = self.args.LEARNING_SUBFIT
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
 
@@ -469,43 +502,200 @@ class DECOOPInferenceEngine:
         self.model = model
         self.eci_thresholds = eci_thresholds  # List[ECIBasedOODDetector]
 
-    def predict(self, tokenized_sample):
-        self.model.eval()
-        input_ids      = tokenized_sample["input_ids"].unsqueeze(0).to(self.model.device)
-        attention_mask = tokenized_sample["attention_mask"].unsqueeze(0).to(self.model.device)
+    def calibrate_q_hat(self, val_dataset, alpha_cp):
+        """
+        使用验证数据集校准全局共形预测 OOD 阈值 (q_hat)。
+        计算出的 q_hat 将设置到 self.model.args.CP_OOD_THRESHOLD 中。
+        """
+        # 使用模型参数中的批量大小作为 DataLoader 的批量大小
+        val_batch_size = self.model.args.BATCH_SIZE
+        # 创建验证集的 DataLoader
+        val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=4)
+
+        all_non_conformity_scores_val = []
+
+        # 获取模型的全局基类集合，用于过滤
+        base_class_set = self.model.base_global_set
+
+
+        if len(val_dataset) == 0:
+            print("Validation set empty, fallback q_hat used.")
+            q_hat = 0.9
+        else:
+            for batch_data in val_dataloader:
+                # batch_prob_vectors 的形状是 (B, NUM_ALL_CLASSES)
+                _, batch_prob_vectors = self.predict(batch_data)
+                
+                # 从批次数据中获取真实全局标签
+                batch_global_labels = batch_data['global_labels'].cpu().numpy()
+
+                # 逐个处理批次中的样本，计算并累积非一致性分数
+                for b in range(batch_prob_vectors.shape[0]):
+                    sample_global_label = batch_global_labels[b].item()
+                    sample_probas = batch_prob_vectors[b] # (NUM_ALL_CLASSES,)
+
+                    # 仅收集属于基类 (ID) 的样本分数
+                    if sample_global_label not in base_class_set:
+                        continue
+                    
+                    # 计算非一致性分数：1.0 - 模型预测该真实全局标签的概率
+                    # sample_probas 已经是 NUM_ALL_CLASSES 维度，所以可以直接用全局标签作为索引
+                    try:
+                        score = 1.0 - sample_probas[sample_global_label]
+                    except IndexError: 
+                        print(f"Warning: IndexError during score calculation for global label {sample_global_label}. Probas shape: {sample_probas.shape}")
+                        score = 1.0 # 错误回退值
+                    
+                    all_non_conformity_scores_val.append(score)
+
+            all_non_conformity_scores_val = np.array(all_non_conformity_scores_val)
+            n_val = len(all_non_conformity_scores_val)
+            q_level = np.ceil((n_val + 1) * (1 - alpha_cp)) / n_val
+            q_hat = np.quantile(all_non_conformity_scores_val, q_level) if n_val > 0 else 0.9
+
+        # 将计算出的 q_hat 设置到模型的参数中
+        self.model.args.CP_OOD_THRESHOLD = q_hat
+        print(f"Validation complete. q_hat = {q_hat:.4f}")
+
+    def predict(self, batch):
+        self.model.eval() # 设置模型为评估模式
+        
+        input_ids = batch["input_ids"].to(self.model.device)
+        attention_mask = batch["attention_mask"].to(self.model.device)
+        raw_texts = batch.get("raw_text", None)
+
+        B = input_ids.size(0) # 获取批次大小
+
+        # 修正：prob_vectors 初始化为总类别数 (self.model.num_all_classes) 的维度，并用 0 填充
+        prob_vectors = torch.zeros(B, self.model.num_all_classes, device=self.model.device) # <--- 修正这一行
+
+        pred_types = [] 
 
         with torch.no_grad():
-            # 1)  (1,C,K) logits
-            logits_batch = self.model.prompt_manager.forward_ood_batch(
+            # 1) 批量获取所有 K 个 OOD 检测器的 logits
+            logits_ood_batch = self.model.prompt_manager.forward_ood_batch(
                 input_ids=input_ids, attention_mask=attention_mask
-            )                                # (1,C,K)
-            probs_batch  = softmax(logits_batch, dim=1).squeeze(0)   # (C,K)
+            ) # (B, C, K)
+            probs_ood_batch = softmax(logits_ood_batch, dim=1) # (B, C, K)
 
-            max_probs, pred_bases = probs_batch.max(dim=0)           # (K,), (K,)
-            non_conf = 1.0 - max_probs                               # (K,)
-            best_k   = int(torch.argmin(non_conf).item())
-            best_pred_base = int(pred_bases[best_k].item())
-            best_non_conf  = float(non_conf[best_k])
+            max_probs, pred_bases = probs_ood_batch.max(dim=1) # max_probs: (B, K), pred_bases: (B, K)
+            non_conf = 1.0 - max_probs # 非一致性分数 (B, K)
 
-            # 2) ecii
-            ecii_thresh = self.eci_thresholds[best_k].get(best_pred_base, 1.0)
-            cp_thresh   = getattr(self.model.args, "CP_OOD_THRESHOLD", 1.0)
-            is_new      = (best_non_conf > ecii_thresh) or (best_non_conf > cp_thresh)
+            best_k_indices = torch.argmin(non_conf, dim=1) # (B,) tensor
 
-            if is_new:
-                pred_type = "NEW"
-                print("NEW")
-                zs_probs, _ = self.model.zs_mlm_classifier.predict(
-                    tokenized_sample.get("raw_text","")
+            is_new_mask = torch.zeros(B, dtype=torch.bool, device=self.model.device)
+
+            for b in range(B):
+                sample_best_k = best_k_indices[b].item()
+                sample_pred_base = pred_bases[b, sample_best_k].item()
+                sample_best_non_conf = float(non_conf[b, sample_best_k])
+
+                sample_ecii_thresh = self.eci_thresholds[sample_best_k].get(sample_pred_base, 1.0)
+                sample_cp_thresh = getattr(self.model.args, "CP_OOD_THRESHOLD", 1.0)
+
+                is_new_sample = (sample_best_non_conf > sample_ecii_thresh) or (sample_best_non_conf > sample_cp_thresh)
+                is_new_mask[b] = torch.tensor(is_new_sample, dtype=torch.bool, device=self.model.device) # <--- 修正这一行
+
+                pred_types.append("NEW" if is_new_sample else "ID")
+            
+            # --- 批量处理 "NEW" 样本 ---
+            if is_new_mask.any():
+                new_sample_indices = torch.where(is_new_mask)[0]
+                
+                if raw_texts is None: 
+                    print("Warning: raw_texts not available in batch for MLMZeroShotClassifier. Using empty strings.")
+                    texts_for_mlm = [""] * len(new_sample_indices)
+                else:
+                    texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
+                
+                zs_probs_batch, _ = self.model.zs_mlm_classifier.predict(texts_for_mlm) # (Num_new_samples, C_all)
+                # 直接赋值，因为 zs_probs_batch 已经是 C_all 维度
+                prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device) 
+
+            # --- 批量处理 "ID" 样本 ---
+            if (~is_new_mask).any():
+                id_sample_indices = torch.where(~is_new_mask)[0]
+                
+                logits_coop_all_k = self.model.prompt_manager.forward_coop_batch(
+                    input_ids=input_ids[id_sample_indices],
+                    attention_mask=attention_mask[id_sample_indices]
+                ) # (Num_id_samples, C_base, K)
+
+                best_k_for_id_samples = best_k_indices[id_sample_indices]
+                
+                best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
+                
+                selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2) # (Num_id_samples, C_base)
+                
+                probs_id_batch = softmax(selected_coop_logits, dim=1) # (Num_id_samples, C_base)
+
+                # 修正：将 C_base 维度的概率映射到 C_all 维度的 prob_vectors 中
+                # 需要确保 self.model.base_global_set 在这里是可用的全局索引列表/张量
+                global_indices_of_base_classes = torch.tensor(
+                    sorted(list(self.model.base_global_set)), # 获取模型最终设置的全局基类索引
+                    dtype=torch.long, device=self.model.device
                 )
-                prob_vec = zs_probs[0]               # (C_base,)
-            else:
-                pred_type = "ID"
-                coop_logits = self.model.prompt_manager.forward_coop(
-                    k=best_k, input_ids=input_ids, attention_mask=attention_mask
-                )
-                prob_vec = softmax(coop_logits, dim=1).cpu().numpy().squeeze()
+                
+                # 使用高级索引将 C_base 概率赋值到 C_all 维度的正确位置
+                # 例如：prob_vectors[行索引, 列索引] = 值
+                # id_sample_indices[:, None] 扩展为 (Num_id_samples, 1) 用于行索引
+                # global_indices_of_base_classes 包含了列索引
+                prob_vectors[id_sample_indices[:, None], global_indices_of_base_classes] = probs_id_batch.to(self.model.device) 
 
-        return pred_type, prob_vec
+        return pred_types, prob_vectors.cpu().numpy() # 返回预测类型列表和 NumPy 数组
+
+    def predict_batch(self, dataset):
+        """
+        对给定数据集进行批量推理，并收集所有预测结果。
+        该方法将负责 DataLoader 的创建和批次循环。
+
+        Returns:
+            tuple: (point_preds_global, prob_matrix_all_classes, predictions_conformal_sets)
+        """
+        print(f"\nPredicting on Test set with Conformal Prediction...")
+        
+        test_batch_size = self.model.args.BATCH_SIZE 
+        test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=4)
+
+        all_point_preds_global = []
+        all_prob_matrix_all_classes = []
+        all_predictions_conformal_sets = []
+        
+        # 使用模型最终设置的整体基类集合，用于映射和共形集构建
+        # base_class_list_sorted = sorted(list(self.model.base_global_set))
+
+        for batch_idx, batch_data in enumerate(test_dataloader):
+            # 调用自身的 predict 方法进行批量预测
+            batch_pred_types, batch_prob_vectors = self.predict(batch_data) # batch_prob_vectors 的形状是 (B, NUM_ALL_CLASSES)
+
+            # 逐个处理批次中的每个样本结果
+            for b in range(batch_prob_vectors.shape[0]):
+                sample_pred_type = batch_pred_types[b] # 当前样本的预测类型 ("ID" 或 "NEW")
+                sample_probas = batch_prob_vectors[b] # 当前样本的概率向量 (NUM_ALL_CLASSES,)
+
+                # 存储点预测结果 (直接是全局索引)
+                pred_global_idx = np.argmax(sample_probas)
+                all_point_preds_global.append(pred_global_idx)
+
+                # 存储完整的概率矩阵 (已是 NUM_ALL_CLASSES 维度)
+                all_prob_matrix_all_classes.append(sample_probas)
+
+                # 构建共形预测集
+                cp_set = []
+                # 从模型参数中获取 q_hat
+                current_q_hat = self.model.args.CP_OOD_THRESHOLD 
+                # 循环所有可能的全局类别索引
+                for global_idx_in_all_classes in range(self.model.args.NUM_ALL_CLASSES): 
+                    if 1.0 - sample_probas[global_idx_in_all_classes] <= current_q_hat:
+                        cp_set.append(global_idx_in_all_classes)
+                all_predictions_conformal_sets.append(cp_set)
+
+        # 将累积的结果列表转换为 NumPy 数组
+        point_preds_global = np.array(all_point_preds_global)
+        prob_matrix_all_classes = np.array(all_prob_matrix_all_classes)
+        predictions_conformal_sets = all_predictions_conformal_sets
+        
+        # 返回所有收集到的结果
+        return point_preds_global, prob_matrix_all_classes, predictions_conformal_sets
 
     
