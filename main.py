@@ -1,47 +1,36 @@
 import os
+
+from utils.loAD import load_data_leave
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
 from sklearn.metrics import classification_report, roc_auc_score
-from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import label_binarize
-import torch
 import torchvision
 from args import parameter_parser
 from models.model import DECOOPInferenceEngine, LLMTrafficDECOOP
-from utils.load_data import load_and_prepare_data_for_llm
+# from utils.loAD import load_and_prepare_data_for_llm
 from utils.utils import debug_model_training
 torchvision.disable_beta_transforms_warning()
 
 args = parameter_parser()
-# LLM_MODEL_NAME = args.LLM_MODEL_NAME
 DEVICE = args.DEVICE
-NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
-NUM_ALL_CLASSES = args.NUM_ALL_CLASSES
 ALPHA_CP = args.ALPHA_CP
 dataset_name = args.dataset_name
 
-# tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
 all_labels_list = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P", "BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"]
 if dataset_name == "ISCXVPN2016":
-    base_traffic_labels_str = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P"]
-    new_traffic_labels_str = ["BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"] 
-# main.py
-base_traffic_labels_str = all_labels_list   # 把 14 类都当基类
-new_traffic_labels_str  = []
+    ood_labels_for_this_run = ["BROWSING"] 
+    base_traffic_labels_str = all_labels_list
 
-args.NUM_BASE_CLASSES = args.NUM_ALL_CLASSES = 14
-args.K_DETECTORS = 1    # 先关掉多 detector / OOD
-args.KL_COEFF = 0.1
-args.PROMPT_LENGTH = 10
+
 # 给 每个 标签一个唯一数字 0‒(C-1)，无论它是基类还新类 整个项目只此一份；一旦确定就不会再变
-all_labels_list = sorted(list(set(base_traffic_labels_str + new_traffic_labels_str)))
 all_class_labels_global_map = {label: i for i, label in enumerate(all_labels_list)}
 
 print(f"Device: {DEVICE}")
 
-train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = load_and_prepare_data_for_llm(
-    args, base_traffic_labels_str, all_class_labels_global_map)
+train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = load_data_leave(
+    args, base_traffic_labels_str, all_class_labels_global_map, ood_labels_to_exclude=ood_labels_for_this_run)
 
 
 NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
@@ -57,33 +46,57 @@ model_instance.set_base_class_global_indices(base_class_indices_num_sorted)
 # debug_model_training(train_dataset, model_instance, base_class_indices_num_sorted)
 
 if __name__ == "__main__":
-    # StratifiedShuffleSplit – avoid leave‑one‑class
-    labels_array = np.array([s['labels'].item() for s in train_dataset])
-    sss = StratifiedShuffleSplit(
-        n_splits=args.K_DETECTORS, test_size=0.20, random_state=42
-    )
-    splits = list(sss.split(np.arange(len(train_dataset)), labels_array))
 
-    # For collecting entropy scores for CP
+    # For collecting entropy scores for CP (This variable is now declared outside the loop to accumulate)
     non_conformity_scores_val = []
 
+    # Store the original global base class indices as determined by load_data.py
+    original_base_class_global_indices = list(base_class_indices_num_sorted) #
+    np.random.shuffle(original_base_class_global_indices)
+    
+    # Ensure K_DETECTORS does not exceed the number of base classes for meaningful "leave-one-class"
+    if args.K_DETECTORS > len(original_base_class_global_indices):
+        print(f"Warning: K_DETECTORS ({args.K_DETECTORS}) is greater than the number of base classes ({len(original_base_class_global_indices)}). Adjusting K_DETECTORS to {len(original_base_class_global_indices)} for leave-one-class setup.")
+        args.K_DETECTORS = len(original_base_class_global_indices)
 
-    for k, (train_ids, val_ids) in enumerate(splits):
-        train_subset = torch.utils.data.Subset(train_dataset, train_ids)
-        val_subset = torch.utils.data.Subset(train_dataset, val_ids)
+    # Store the original model's base class configuration for restoration later
+    original_model_base_global_indices_state = list(model_instance.base_class_global_indices)
 
-        print(f"\n[Training PromptLearner OOD #{k}] with {len(train_ids)} ID and {len(val_ids)} pseudo-OOD samples")
-        # Use built-in fit method with entropy-margin learning on pseudo-OOD
-        model_instance.fit(train_subset, k=k)
+    # Loop through each detector, treating a different base class as pseudo-OOD for its training
+    for k in range(args.K_DETECTORS):
+        # The class that will be temporarily considered OOD for detector 'k'
+        # We cycle through the original base classes to assign a unique pseudo-OOD for each detector
+        pseudo_ood_class_global_idx = original_base_class_global_indices[k % len(original_base_class_global_indices)]
+        
+        # Define the ID classes for *this* detector's training (all original base classes except the pseudo-OOD one)
+        id_classes_for_detector_k_global_indices = [
+            idx for idx in original_base_class_global_indices if idx != pseudo_ood_class_global_idx
+        ]
 
-        # model_instance.collect_cp_entropy(val_subset, k=k)
-        model_instance.eci_calibration(val_subset, k=k, alpha=ALPHA_CP)
+        # Temporarily set the model's base class configuration for the current detector's training/calibration phase
+        # This is crucial for `model.fit` and `model.eci_calibration` to correctly identify ID/OOD.
+        model_instance.set_base_class_global_indices(id_classes_for_detector_k_global_indices)
+        
+        print(f"\n[Training PromptLearner OOD #{k}] Pseudo-OOD class for this detector: {pseudo_ood_class_global_idx}")
+        print(f"  ID classes for this detector: {id_classes_for_detector_k_global_indices}")
+        # Pass the full train_dataset (which contains all original base classes) to the training function.
+        # The `fit` method will use the temporarily set `model_instance.base_global_set`
+        # to distinguish ID samples from the pseudo-OOD samples (the left-out class).
+        print(f"\n[Training PromptLearner OOD #{k}] with {len(train_dataset)} samples (ID and pseudo-OOD determined internally).")
+        model_instance.fit(train_dataset, k=k)
+        
+        # Similarly, pass the full val_dataset for calibration.
+        # `eci_calibration` will also use the temporarily set `model_instance.base_global_set`
+        # to collect non-conformity scores only for the ID samples.
+        model_instance.eci_calibration(val_dataset, k=k, alpha=ALPHA_CP)
 
-    # 估计 entropy 阈值 τ，可以使用 validation set 平均 entropy
-    # 固定阈值
-    tau_entropy = 1.2  # 可调参数
-    model_instance.fit_sub_classifiers(train_dataset, threshold_tau=tau_entropy)
+    model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
+    print(f"\nRestored model's base class configuration to: {model_instance.base_class_global_indices}")
+
+
+    model_instance.fit_sub_classifiers(train_dataset)
     print("LLMTrafficDECOOP Model Training Finished.")
+
     engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
 
     # ----------------- Conformal Calibration -----------------
@@ -146,7 +159,7 @@ if __name__ == "__main__":
                 cp_set.append(global_idx)
         predictions_conformal_sets.append(cp_set)
 
-    # ----------------- Evaluation -----------------
+    # ----------------- Evaluatfion -----------------
     print("\nEvaluating Conformal Prediction...")
     coverage = 0
     avg_size = 0

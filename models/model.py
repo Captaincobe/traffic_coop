@@ -158,6 +158,7 @@ class PromptLearnerManager(nn.Module):
         # logits = torch.clamp(logits, min=-10, max=10)
         return logits
         # return self.classifier(cls_token)
+        
     def forward_ood_batch(self, input_ids, attention_mask):
         """
         input_ids:  (B, L)
@@ -207,27 +208,6 @@ class PromptLearnerManager(nn.Module):
     def get_coop_parameters_k(self, k: int):
         return list(self.coop_prompts[k].parameters()) + list(self.classifier.parameters())
     
-def train_prompt_learner(model, forward_fn, dataloader, optimizer, loss_fn, scheduler=None, max_epochs=3, device="cuda"):
-    model.train()
-    for epoch in range(max_epochs):
-        total_loss = 0
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = forward_fn(input_ids=input_ids, attention_mask=attention_mask)
-
-            loss = loss_fn(outputs, labels)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            if scheduler: scheduler.step()
-
-            total_loss += loss.item()
-        print(f"[PromptTuning][Epoch {epoch+1}/{max_epochs}] Loss: {total_loss/len(dataloader):.4f}")
 
 class LLMTrafficDECOOP(nn.Module):
     def __init__(self, args):
@@ -243,11 +223,7 @@ class LLMTrafficDECOOP(nn.Module):
             torch_dtype=torch.float32,
             # low_cpu_mem_usage=True
         ).to(self.device)
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
-        # self.shared_encoder = AutoModelForMaskedLM.from_pretrained(
-        #     self.llm_model_name,
-        #     torch_dtype=torch.float32
-        # ).to(self.device)
+
         for param in self.shared_encoder.parameters():
             param.requires_grad = False
         # Embeddings remain frozen for efficiency
@@ -418,7 +394,7 @@ class LLMTrafficDECOOP(nn.Module):
         for p in self.prompt_manager.ood_prompts[k].parameters():
             p.requires_grad = False
     
-    def fit_sub_classifiers(self, train_dataset, threshold_tau):
+    def fit_sub_classifiers(self, train_dataset):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
@@ -453,9 +429,7 @@ class LLMTrafficDECOOP(nn.Module):
                                                     device=self.device)
                         is_id = id_by_entropy & id_by_label            # 同时满足才算 ID
 
-                    # Remove no_grad: allow encoder + prompt to be updated for score function
-                    coop_logits = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
-                    logits_sub = coop_logits
+                    logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
 
                     # Compute logits_zs for KL loss, zs_classifier remains frozen but allow gradient for input
                     with torch.no_grad():
@@ -486,110 +460,19 @@ class LLMTrafficDECOOP(nn.Module):
             for p in self.prompt_manager.coop_prompts[k].parameters():
                 p.requires_grad = False
 
-    # def predict_proba(self, tokenized_sample):
-    #     self.eval()
-    #     input_ids = tokenized_sample["input_ids"].unsqueeze(0).to(self.device)
-    #     attention_mask = tokenized_sample["attention_mask"].unsqueeze(0).to(self.device)
-
-    #     with torch.no_grad():
-    #         detector_scores = []
-    #         probs_k = []
-    #         for k in range(self.k_detectors):
-    #             logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-    #             probs = softmax(logits, dim=1)
-    #             entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
-    #             detector_scores.append(entropy.item())
-    #             probs_k.append(probs.squeeze(0))
-
-    #         # Use detector with lowest entropy (most confident)
-    #         max_k = int(np.argmin(detector_scores))
-    #         selected_probs = probs_k[max_k]
-    #         pred_class = int(torch.argmax(selected_probs))
-    #         non_conf_score = 1.0 - selected_probs[pred_class].item()
-
-    #         coop_logits = self.prompt_manager.forward_coop(
-    #             k=max_k, input_ids=input_ids, attention_mask=attention_mask
-    #         )
-    #         probs = softmax(coop_logits, dim=1)
-    #     return probs.cpu().numpy().squeeze()
-
-
 
 class DECOOPInferenceEngine:
     def __init__(self, model, eci_thresholds):
         self.model = model
         self.eci_thresholds = eci_thresholds  # List[ECIBasedOODDetector]
 
-    # def predict(self, tokenized_sample):
-    #     """
-    #     Returns
-    #     -------
-    #     pred_type : str
-    #         'ID'  – predicted as one of the base classes (via COOP prompt)
-    #         'NEW' – predicted as a new / unseen class (via zero‑shot MLM)
-    #     prob_vec : np.ndarray, shape = (C,) where C = num_all_classes
-    #         Probability vector over **all** classes.  For simplicity we
-    #         return a length‑num_base_classes vector; the caller can map
-    #         indices → global indices.
-    #     """
-
-    #     self.model.eval()
-    #     input_ids = tokenized_sample["input_ids"].unsqueeze(0).to(self.model.device)
-    #     attention_mask = tokenized_sample["attention_mask"].unsqueeze(0).to(self.model.device)
-
-    #     best_k         = None
-    #     best_non_conf  = 1.1     # > 1 guarantees replacement
-    #     best_pred_base = None
-
-    #     with torch.no_grad():
-    #         # ---------- 1. Evaluate K new‑class detectors ----------
-    #         for k in range(self.model.k_detectors):
-    #             logits = self.model.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-    #             probs  = softmax(logits, dim=1).squeeze(0)              # (B=1, C) -> (C,)
-    #             pred_base = int(torch.argmax(probs))
-    #             non_conf  = 1.0 - probs[pred_base].item()               # MiD_k(x)
-
-    #             if non_conf < best_non_conf:
-    #                 best_non_conf  = non_conf
-    #                 best_k         = k
-    #                 best_pred_base = pred_base
-    #                 best_probs_det = probs                                # save for later
-
-    #         # ---------- 2. Thresholding ----------
-    #         # ECII per‑class threshold
-    #         ecii_thresh = self.eci_thresholds[best_k].get(best_pred_base, 1.0)
-    #         # Global CP entropy threshold
-    #         cp_thresh   = getattr(self.model.args, "CP_OOD_THRESHOLD", 1.0)
-    #         is_new      = (best_non_conf > ecii_thresh) or (best_non_conf > cp_thresh)
-
-    #         if is_new:
-    #             # -------- NEW / unseen class --------
-    #             pred_type = "NEW"
-    #             zs_probs, _ = self.model.zs_mlm_classifier.predict("")   # dummy init
-    #             # Re‑run zero‑shot on the real sample text
-    #             input_text = tokenized_sample["raw_text"] if "raw_text" in tokenized_sample else ""
-    #             zs_probs, label_order = self.model.zs_mlm_classifier.predict(input_text)
-    #             prob_vec = zs_probs[0]                                   # (C_base,)
-    #         else:
-    #             # -------- ID (base‑class) --------
-    #             pred_type   = "ID"
-    #             coop_logits = self.model.prompt_manager.forward_coop(
-    #                 k=best_k, input_ids=input_ids, attention_mask=attention_mask
-    #             )
-    #             prob_vec = softmax(coop_logits, dim=1).cpu().numpy().squeeze()
-
-    #     return pred_type, prob_vec
-
     def predict(self, tokenized_sample):
-        # ---------------------------------------------
-        # 替换原函数体为下列代码，缩进保持 8 空格
-        # ---------------------------------------------
         self.model.eval()
         input_ids      = tokenized_sample["input_ids"].unsqueeze(0).to(self.model.device)
         attention_mask = tokenized_sample["attention_mask"].unsqueeze(0).to(self.model.device)
 
         with torch.no_grad():
-            # 1) 一次性得到 (1,C,K) logits
+            # 1)  (1,C,K) logits
             logits_batch = self.model.prompt_manager.forward_ood_batch(
                 input_ids=input_ids, attention_mask=attention_mask
             )                                # (1,C,K)
@@ -601,7 +484,7 @@ class DECOOPInferenceEngine:
             best_pred_base = int(pred_bases[best_k].item())
             best_non_conf  = float(non_conf[best_k])
 
-            # 2) 阈值判别
+            # 2) ecii
             ecii_thresh = self.eci_thresholds[best_k].get(best_pred_base, 1.0)
             cp_thresh   = getattr(self.model.args, "CP_OOD_THRESHOLD", 1.0)
             is_new      = (best_non_conf > ecii_thresh) or (best_non_conf > cp_thresh)
@@ -620,6 +503,5 @@ class DECOOPInferenceEngine:
                 prob_vec = softmax(coop_logits, dim=1).cpu().numpy().squeeze()
 
         return pred_type, prob_vec
-    def update_thresholds(self, tokenized_sample):
-        pass
+
     
