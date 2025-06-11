@@ -158,7 +158,7 @@ class PromptLearnerManager(nn.Module):
         # logits = torch.clamp(logits, min=-10, max=10)
         return logits
         # return self.classifier(cls_token)
-        
+
     def forward_ood_batch(self, input_ids, attention_mask):
         """
         input_ids:  (B, L)
@@ -400,7 +400,6 @@ class LLMTrafficDECOOP(nn.Module):
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
 
-        # self.shared_encoder.eval()  # Allow encoder to be trainable for gradient flow
 
         for k in range(self.k_detectors):
             print(f"\n[Training Sub-classifier + COOP Prompt #{k}]")
@@ -491,6 +490,7 @@ class DECOOPInferenceEngine:
 
             if is_new:
                 pred_type = "NEW"
+                print("NEW")
                 zs_probs, _ = self.model.zs_mlm_classifier.predict(
                     tokenized_sample.get("raw_text","")
                 )

@@ -42,10 +42,11 @@ def parameter_parser():
     parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=128,
                     help='Maximum sequence length for LLM input.')
     
-    parser.add_argument('--alpha_cp', dest='ALPHA_CP', type=float, default=0.1,
+    parser.add_argument('--alpha_cp', dest='ALPHA_CP', type=float, default=0.2,
                         help='Alpha parameter for confidence penalty.')
     
     parser.add_argument('--cp_ood', dest='CP_OOD_THRESHOLD', type=float, default=0.8)
+    parser.add_argument('--prompt_len', dest='PROMPT_LENGTH', type=float, default=10)
     
     parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
                         help='Number of detectors per DECOOP paper (often K=3).')

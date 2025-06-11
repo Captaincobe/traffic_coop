@@ -1,5 +1,7 @@
 import os
 
+import torch
+
 from utils.loAD import load_data_leave
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -8,7 +10,7 @@ from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.preprocessing import label_binarize
 import torchvision
 from args import parameter_parser
-from models.model import DECOOPInferenceEngine, LLMTrafficDECOOP
+from utils.model import DECOOPInferenceEngine, LLMTrafficDECOOP
 # from utils.loAD import load_and_prepare_data_for_llm
 from utils.utils import debug_model_training
 torchvision.disable_beta_transforms_warning()
@@ -20,7 +22,7 @@ dataset_name = args.dataset_name
 
 all_labels_list = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P", "BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"]
 if dataset_name == "ISCXVPN2016":
-    ood_labels_for_this_run = ["BROWSING"] 
+    ood_labels_for_this_run = ["VOIP"] 
     base_traffic_labels_str = all_labels_list
 
 
@@ -97,9 +99,15 @@ if __name__ == "__main__":
     model_instance.fit_sub_classifiers(train_dataset)
     print("LLMTrafficDECOOP Model Training Finished.")
 
-    engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
+    try:
+        model_save_path = f"./models/{dataset_name}/trained_{args.dataset_name}.pth"
+        torch.save(model_instance.state_dict(), model_save_path) # 包含所有可学习的参数
+    except Exception as e:
+        print(f"Error saving model: {e}")
 
     # ----------------- Conformal Calibration -----------------
+    engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
+
     print("\nStarting Conformal Prediction Validation...")
     base_class_set = set(base_class_indices_num_sorted)
     base_class_list = sorted(list(base_class_set))
