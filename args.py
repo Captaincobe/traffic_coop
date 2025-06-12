@@ -41,12 +41,12 @@ def parameter_parser():
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-5,
                         help='Learning rate for the LLM backbone.')
-    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=1e-4,
+    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-4,
                         help='Learning rate for the classification head.')
 
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=10,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=20,
                         help='Number of epochs for Detector training.')
-    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=10,
+    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=20,
                         help='Number of epochs for Subclassifier training.')
 
 

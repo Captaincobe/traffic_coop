@@ -118,7 +118,7 @@ class SharedRoBERTaPromptLearner(nn.Module):
     def __init__(self, prompt_length, embedding_dim):
         super().__init__()
         self.prompt_length = prompt_length
-        self.prompt_embedding = nn.Parameter(torch.empty(prompt_length, embedding_dim, dtype=torch.float32))
+        self.prompt_embedding = nn.Parameter(torch.empty(prompt_length, embedding_dim, dtype=torch.bfloat16))
         # nn.init.kaiming_normal_(self.prompt_embedding,nonlinearity='leaky_relu') # xavier_normal_
         nn.init.normal_(self.prompt_embedding, std=0.02)
         self.ln = nn.LayerNorm(embedding_dim)
@@ -145,7 +145,7 @@ class PromptLearnerManager(nn.Module):
         self.coop_prompts = nn.ModuleList([
             SharedRoBERTaPromptLearner(prompt_length, self.embedding_dim) for _ in range(K)
         ])
-        self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.float32)
+        self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.bfloat16)
 
     def _forward_with_prompt(self, prompt_module, input_ids, attention_mask):
 
@@ -253,7 +253,7 @@ class LLMTrafficDECOOP(nn.Module):
         # -------------------- Shared Encoder (frozen) --------------------
         self.shared_encoder = AutoModel.from_pretrained(
             self.llm_model_name,
-            torch_dtype=torch.float32,
+            torch_dtype=torch.bfloat16,
             # low_cpu_mem_usage=True
         ).to(self.device)
 
@@ -305,7 +305,7 @@ class LLMTrafficDECOOP(nn.Module):
         self.global2base = {g: i for i, g in enumerate(self.base_class_global_indices)}
 
     def eci_calibration(self, calibration_dataset, k, alpha=0.1):
-        dataloader = DataLoader(calibration_dataset, batch_size=self.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=1)
+        dataloader = DataLoader(calibration_dataset, batch_size=self.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=16)
 
         self.eval()
         # scores_per_class = {i: [] for i in range(self.num_base_classes)}
@@ -368,7 +368,7 @@ class LLMTrafficDECOOP(nn.Module):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
-        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=1)
+        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
 
         # Keep encoder frozen to save memory; only train prompt & classifier
         self.prompt_manager.train()
@@ -420,15 +420,16 @@ class LLMTrafficDECOOP(nn.Module):
                 entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
 
                 # 判断是否属于基类：使用全局索引集合
-                is_ood = torch.tensor([y.item() not in self.base_global_set for y in labels], device=self.device)
-                is_id = ~is_ood
+                base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
+                is_id = torch.isin(labels, base_indices_tensor)
+                is_ood = ~is_id
 
                 if is_id.any():
                     # —— 全局标签 → 基类标签 —— 
-                    y_base = torch.tensor(
-                        [self.global2base[y.item()] for y in labels[is_id]],
-                        device=self.device
-                    )
+                    mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                    for g, b in self.global2base.items():
+                        mapping_tensor[g] = b
+                    y_base = mapping_tensor[labels[is_id]]
                     loss_id = loss_fn(logits[is_id], y_base)
                     preds = torch.argmax(logits[is_id], dim=1)
                     total_correct += (preds == y_base).sum().item()
@@ -472,7 +473,7 @@ class LLMTrafficDECOOP(nn.Module):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_SUBFIT
 
-        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=1)
+        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
         scaler = GradScaler()
 
 
@@ -524,9 +525,9 @@ class LLMTrafficDECOOP(nn.Module):
                         probs_ood  = softmax(logits_ood, dim=1)
                         entropy    = -torch.sum(probs_ood * torch.log(probs_ood + 1e-8), dim=1)
 
+                        base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
                         id_by_entropy = entropy <= self.args.CP_OOD_THRESHOLD
-                        id_by_label   = torch.tensor([y.item() in self.base_global_set for y in labels],
-                                                    device=self.device)
+                        id_by_label   = torch.isin(labels, base_indices_tensor)
                         is_id = id_by_entropy & id_by_label            # 同时满足才算 ID
 
                     logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
@@ -539,10 +540,10 @@ class LLMTrafficDECOOP(nn.Module):
 
                     loss = 0.0
                     if is_id.any():
-                        y_base = torch.tensor(
-                            [self.global2base[y.item()] for y in labels[is_id]],
-                            device=self.device
-                        )
+                        mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                        for g, b in self.global2base.items():
+                            mapping_tensor[g] = b
+                        y_base = mapping_tensor[labels[is_id]]
                         loss_id = cross_entropy(logits_sub[is_id], y_base)
                         loss += loss_id
                     if (~is_id).any():
@@ -590,7 +591,7 @@ class DECOOPInferenceEngine:
         # 使用模型参数中的批量大小作为 DataLoader 的批量大小
         val_batch_size = self.model.args.BATCH_SIZE
         # 创建验证集的 DataLoader
-        val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=1)
+        val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=16)
 
         all_non_conformity_scores_val = []
 
@@ -736,7 +737,7 @@ class DECOOPInferenceEngine:
         print(f"\nPredicting on Test set with Conformal Prediction...")
         
         test_batch_size = self.model.args.BATCH_SIZE 
-        test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=1)
+        test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=16)
 
         all_point_preds_global = []
         all_prob_matrix_all_classes = []
