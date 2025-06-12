@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
@@ -116,7 +117,7 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     raise ValueError("For training data, 'base_class_global_indices' cannot be empty.")
                 global_to_local_base_map = {global_idx: local_idx for local_idx, global_idx in enumerate(sorted_base_class_global_indices)}
 
-
+            raw_lengths = []
             for idx, row in dataframe.iterrows():
                 global_label_str = row['label']
                 global_label_numerical = all_class_labels_global_map.get(global_label_str)
@@ -137,6 +138,12 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     padding="max_length",
                     return_tensors="pt"
                 )
+                # tokenized = tokenizer(
+                #     full_input,
+                #     truncation=False, # 不截断
+                #     padding=False,    # 不填充
+                #     return_tensors="pt"
+                # )
 
                 target_label_numerical = global_label_numerical
                 if is_training_data:
@@ -155,6 +162,17 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     "global_labels": torch.tensor(global_label_numerical, dtype=torch.long),
                     "raw_text": full_input
                 })
+                # current_raw_length = tokenized["input_ids"].size(1)
+                # raw_lengths.append(current_raw_length)
+            # if raw_lengths: # 确保列表不为空
+            #     print(f"\n--- Tokenized Length Statistics for this DataFrame ---")
+            #     print(f"  Minimum raw tokenized length: {np.min(raw_lengths)}")
+            #     print(f"  Maximum raw tokenized length: {np.max(raw_lengths)}")
+            #     print(f"  Average raw tokenized length: {np.mean(raw_lengths):.2f}")
+            #     print(f"  95th percentile raw tokenized length: {np.percentile(raw_lengths, 95):.2f}")
+            #     print(f"  Number of samples exceeding current max_seq_len ({max_seq_len}): {sum(1 for l in raw_lengths if l > max_seq_len)}")
+            #     print(f"----------------------------------------------------\n")
+            # # -----------------------------------------
             return tokenized_list
 
 

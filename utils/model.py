@@ -5,6 +5,8 @@ from torch.nn.functional import softmax, cross_entropy
 from transformers import AutoModel
 from utils.utils import kl_divergence_loss_from_logits
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 
 class MLMZeroShotClassifier:
     def __init__(self, model_name, label_token_map, template="This traffic is [MASK].", device="cuda"):
@@ -100,7 +102,7 @@ class SharedEncoderClassifier(nn.Module):
     def __init__(self, shared_encoder, hidden_dim, num_classes):
         super().__init__()
         self.encoder = shared_encoder
-        self.classifier = nn.Linear(hidden_dim, num_classes, dtype=torch.float32)
+        self.classifier = nn.Linear(hidden_dim, num_classes) # , dtype=torch.float16
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, cls_token=None):
         if cls_token is not None:
@@ -303,7 +305,7 @@ class LLMTrafficDECOOP(nn.Module):
         self.global2base = {g: i for i, g in enumerate(self.base_class_global_indices)}
 
     def eci_calibration(self, calibration_dataset, k, alpha=0.1):
-        dataloader = DataLoader(calibration_dataset, batch_size=self.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=4)
+        dataloader = DataLoader(calibration_dataset, batch_size=self.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=1)
 
         self.eval()
         # scores_per_class = {i: [] for i in range(self.num_base_classes)}
@@ -366,16 +368,43 @@ class LLMTrafficDECOOP(nn.Module):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
-        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
+        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=1)
 
         # Keep encoder frozen to save memory; only train prompt & classifier
         self.prompt_manager.train()
 
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             self.prompt_manager.get_ood_parameters_k(k),
             lr=learning_rate
         )
         loss_fn = nn.CrossEntropyLoss()
+        # === 学习率调度器设置 (针对 fit 方法) ===
+        num_training_steps = len(dataloader) * self.args.NUM_EPOCHS # 总步数
+
+        if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+            # 线性预热的 Lambda 函数
+            warmup_steps = int(num_training_steps * self.args.WARMUP_EPOCHS / self.args.NUM_EPOCHS)
+            def lr_lambda(current_step: int):
+                if current_step < warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                # 余弦衰减，从预热结束后的学习率开始衰减
+                progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+                return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+            scheduler = LambdaLR(optimizer, lr_lambda)
+        elif self.args.LR_SCHEDULER_TYPE == "plateau":
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min', # 监控损失
+                factor=self.args.PLATEAU_FACTOR,
+                patience=self.args.PLATEAU_PATIENCE,
+                verbose=True
+            )
+            print(f"[Info] Using ReduceLROnPlateau for OOD prompt {k}.")
+        else:
+            scheduler = None # 不使用调度器
+            print("[Info] No LR scheduler applied for OOD prompt training.")
+        scaler = GradScaler()
 
         for epoch in range(self.args.NUM_EPOCHS):
             total_loss = 0
@@ -385,7 +414,7 @@ class LLMTrafficDECOOP(nn.Module):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
-
+                optimizer.zero_grad()
                 logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
                 probs = softmax(logits, dim=1)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
@@ -416,11 +445,19 @@ class LLMTrafficDECOOP(nn.Module):
 
                 loss = loss_id + self.args.LAMBDA_ENTROPY * loss_margin
 
-                optimizer.zero_grad()
-                loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.prompt_manager.parameters(), max_norm=1.0)
-                optimizer.step()
+                # optimizer.zero_grad()
+                # loss.backward()
+                # # torch.nn.utils.clip_grad_norm_(self.prompt_manager.parameters(), max_norm=1.0)
+                # optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer) # 在裁剪前unscale
+                torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 应用梯度裁剪
 
+                scaler.step(optimizer)       # 使用 scaler.step()
+                scaler.update()              # 使用 scaler.update()
+
+                if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                    scheduler.step() # CosineAnnealingLR是按步更新
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(dataloader)
@@ -435,16 +472,41 @@ class LLMTrafficDECOOP(nn.Module):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_SUBFIT
 
-        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
+        dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=1)
+        scaler = GradScaler()
 
 
         for k in range(self.k_detectors):
             print(f"\n[Training Sub-classifier + COOP Prompt #{k}]")
-            optimizer = torch.optim.Adam(
+            optimizer = torch.optim.AdamW(
                 self.prompt_manager.get_coop_parameters_k(k) +
                 list(self.sub_classifiers_[k].parameters()),
                 lr=learning_rate
             )
+            # === 学习率调度器设置 (针对 fit_sub_classifiers 方法) ===
+            num_training_steps = len(dataloader) * self.args.N_EPOCHS_SUBCLASSIFIER
+
+            if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                warmup_steps = int(num_training_steps * self.args.WARMUP_EPOCHS / self.args.N_EPOCHS_SUBCLASSIFIER)
+                def lr_lambda(current_step: int):
+                    if current_step < warmup_steps:
+                        return float(current_step) / float(max(1, warmup_steps))
+                    progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+                    return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+                scheduler = LambdaLR(optimizer, lr_lambda)
+            elif self.args.LR_SCHEDULER_TYPE == "plateau":
+                scheduler = ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',
+                    factor=self.args.PLATEAU_FACTOR,
+                    patience=self.args.PLATEAU_PATIENCE,
+                    verbose=True
+                )
+                print(f"[Info] Using ReduceLROnPlateau for COOP prompt {k}.")
+            else:
+                scheduler = None
+                print("[Info] No LR scheduler applied for COOP prompt training.")
 
             for epoch in range(self.args.N_EPOCHS_SUBCLASSIFIER):
                 total_loss = 0
@@ -454,8 +516,10 @@ class LLMTrafficDECOOP(nn.Module):
                     attention_mask = batch["attention_mask"].to(self.device)
                     labels = batch["labels"].to(self.device)
 
+                    optimizer.zero_grad()
                     # OOD detector to mask ID/OOD using prompt_manager.forward_ood
                     with torch.no_grad():
+
                         logits_ood = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
                         probs_ood  = softmax(logits_ood, dim=1)
                         entropy    = -torch.sum(probs_ood * torch.log(probs_ood + 1e-8), dim=1)
@@ -485,12 +549,28 @@ class LLMTrafficDECOOP(nn.Module):
                         loss_kl = kl_divergence_loss_from_logits(logits_sub[~is_id], logits_zs[~is_id])
                         loss += self.args.KL_COEFF * loss_kl
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    # optimizer.zero_grad()
+                    # loss.backward()
+                    # torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                    # optimizer.step()
+
+                    scaler.scale(loss).backward()
+                    # 梯度裁剪
+                    scaler.unscale_(optimizer) # 在裁剪前unscale
+                    torch.nn.utils.clip_grad_norm_(
+                        self.prompt_manager.get_coop_parameters_k(k) + list(self.sub_classifiers_[k].parameters()),
+                        max_norm=1.0
+                    )
+
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                        scheduler.step() # CosineAnnealingLR是按步更新
                     total_loss += loss.item()
                 print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Total Loss: {total_loss/len(dataloader):.4f}")
+                if scheduler and self.args.LR_SCHEDULER_TYPE == "plateau":
+                    scheduler.step(total_loss/len(dataloader)) # ReduceLROnPlateau是按epoch更新，传入监控指标
 
             # ---- freeze the k‑th COOP prompt after training ----
             for p in self.prompt_manager.coop_prompts[k].parameters():
@@ -510,7 +590,7 @@ class DECOOPInferenceEngine:
         # 使用模型参数中的批量大小作为 DataLoader 的批量大小
         val_batch_size = self.model.args.BATCH_SIZE
         # 创建验证集的 DataLoader
-        val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=4)
+        val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=1)
 
         all_non_conformity_scores_val = []
 
@@ -573,6 +653,7 @@ class DECOOPInferenceEngine:
 
         with torch.no_grad():
             # 1) 批量获取所有 K 个 OOD 检测器的 logits
+
             logits_ood_batch = self.model.prompt_manager.forward_ood_batch(
                 input_ids=input_ids, attention_mask=attention_mask
             ) # (B, C, K)
@@ -655,7 +736,7 @@ class DECOOPInferenceEngine:
         print(f"\nPredicting on Test set with Conformal Prediction...")
         
         test_batch_size = self.model.args.BATCH_SIZE 
-        test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=4)
+        test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=1)
 
         all_point_preds_global = []
         all_prob_matrix_all_classes = []
@@ -677,25 +758,19 @@ class DECOOPInferenceEngine:
                 pred_global_idx = np.argmax(sample_probas)
                 all_point_preds_global.append(pred_global_idx)
 
-                # 存储完整的概率矩阵 (已是 NUM_ALL_CLASSES 维度)
                 all_prob_matrix_all_classes.append(sample_probas)
 
-                # 构建共形预测集
                 cp_set = []
-                # 从模型参数中获取 q_hat
                 current_q_hat = self.model.args.CP_OOD_THRESHOLD 
-                # 循环所有可能的全局类别索引
                 for global_idx_in_all_classes in range(self.model.args.NUM_ALL_CLASSES): 
                     if 1.0 - sample_probas[global_idx_in_all_classes] <= current_q_hat:
                         cp_set.append(global_idx_in_all_classes)
                 all_predictions_conformal_sets.append(cp_set)
 
-        # 将累积的结果列表转换为 NumPy 数组
         point_preds_global = np.array(all_point_preds_global)
         prob_matrix_all_classes = np.array(all_prob_matrix_all_classes)
         predictions_conformal_sets = all_predictions_conformal_sets
         
-        # 返回所有收集到的结果
         return point_preds_global, prob_matrix_all_classes, predictions_conformal_sets
 
     
