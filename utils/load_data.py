@@ -17,10 +17,10 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
     base_traffic_labels_str = [label for label in full_traffic_labels_list if label not in ood_labels_to_exclude]
     new_traffic_labels_str = [label for label in full_traffic_labels_list if label in ood_labels_to_exclude]
-
-    csv_path = f'/home/icdm/code/trafficCOOP/datasets/{dataset_name}/raw/{dataset_name}.csv'
+    dataset_root='/home/icdm/code/trafficCOOP/datasets'
+    csv_path = os.path.join(dataset_root, dataset_name, "raw", f"{dataset_name}.csv")
     ood_suffix = "_".join(sorted(ood_labels_to_exclude)) if ood_labels_to_exclude else "all_base"
-    cache_file = f"/home/icdm/code/trafficCOOP/datasets/{dataset_name}/raw/tokenized_{ood_suffix}.pt"
+    cache_file = os.path.join(dataset_root, dataset_name, "raw", f"tokenized_{ood_suffix}.pt")
 
     if os.path.exists(cache_file):
         print(f"Loading tokenized datasets from cache: {cache_file}")

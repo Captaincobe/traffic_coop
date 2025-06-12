@@ -1,5 +1,3 @@
-import math
-import torch
 from torch.utils.data import Dataset
 
 # def convert_feature_to_prompt_text(feature_row) -> str:

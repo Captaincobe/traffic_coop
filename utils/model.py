@@ -5,9 +5,8 @@ from torch.nn.functional import softmax, cross_entropy
 from transformers import AutoModel
 from utils.utils import kl_divergence_loss_from_logits
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
-
 class MLMZeroShotClassifier:
     def __init__(self, model_name, label_token_map, template="This traffic is [MASK].", device="cuda"):
         from transformers import AutoTokenizer, AutoModelForMaskedLM
@@ -415,9 +414,10 @@ class LLMTrafficDECOOP(nn.Module):
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 optimizer.zero_grad()
-                logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
-                probs = softmax(logits, dim=1)
-                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+                with autocast():
+                    logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
+                    probs = softmax(logits, dim=1)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
 
                 # 判断是否属于基类：使用全局索引集合
                 base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
@@ -529,26 +529,26 @@ class LLMTrafficDECOOP(nn.Module):
                         id_by_entropy = entropy <= self.args.CP_OOD_THRESHOLD
                         id_by_label   = torch.isin(labels, base_indices_tensor)
                         is_id = id_by_entropy & id_by_label            # 同时满足才算 ID
+                    with autocast():
+                        logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
 
-                    logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
+                        # Compute logits_zs for KL loss, zs_classifier remains frozen but allow gradient for input
+                        with torch.no_grad():
+                            outputs_zs = self.shared_encoder(input_ids=input_ids, attention_mask=attention_mask)
+                            cls_token_zs = outputs_zs.last_hidden_state[:, 0]
+                            logits_zs = self.zs_classifier_.classifier(cls_token_zs)
 
-                    # Compute logits_zs for KL loss, zs_classifier remains frozen but allow gradient for input
-                    with torch.no_grad():
-                        outputs_zs = self.shared_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                        cls_token_zs = outputs_zs.last_hidden_state[:, 0]
-                        logits_zs = self.zs_classifier_.classifier(cls_token_zs)
-
-                    loss = 0.0
-                    if is_id.any():
-                        mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
-                        for g, b in self.global2base.items():
-                            mapping_tensor[g] = b
-                        y_base = mapping_tensor[labels[is_id]]
-                        loss_id = cross_entropy(logits_sub[is_id], y_base)
-                        loss += loss_id
-                    if (~is_id).any():
-                        loss_kl = kl_divergence_loss_from_logits(logits_sub[~is_id], logits_zs[~is_id])
-                        loss += self.args.KL_COEFF * loss_kl
+                        loss = 0.0
+                        if is_id.any():
+                            mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                            for g, b in self.global2base.items():
+                                mapping_tensor[g] = b
+                            y_base = mapping_tensor[labels[is_id]]
+                            loss_id = cross_entropy(logits_sub[is_id], y_base)
+                            loss += loss_id
+                        if (~is_id).any():
+                            loss_kl = kl_divergence_loss_from_logits(logits_sub[~is_id], logits_zs[~is_id])
+                            loss += self.args.KL_COEFF * loss_kl
 
                     # optimizer.zero_grad()
                     # loss.backward()
