@@ -19,19 +19,15 @@ def get_formatted_feature_value(feature_name, value, format_str="", unit=""):
 
 def convert_feature_to_prompt_text(dataset_name, feature_row) -> str:
     if dataset_name == "ISCXVPN2016":
-        try:
-            duration = float(feature_row.get("duration", 0))
-            pkts_per_sec = float(feature_row.get("flowPktsPerSecond", 0))
-            bytes_per_sec = float(feature_row.get("flowBytesPerSecond", 0))
-            mean_fiat = float(feature_row.get("mean_fiat", 0))
-            min_fiat = float(feature_row.get("min_fiat", 0))
-            mean_biat = float(feature_row.get("mean_biat", 0))
-            min_biat = float(feature_row.get("min_biat", 0))
-            mean_active = float(feature_row.get("mean_active", 0))
-            mean_idle = float(feature_row.get("mean_idle", 0))
-        except Exception as e:
-            raise ValueError(f"Feature row parsing error: {e}")
-
+        duration = float(feature_row.get("duration", 0))
+        pkts_per_sec = float(feature_row.get("flowPktsPerSecond", 0))
+        bytes_per_sec = float(feature_row.get("flowBytesPerSecond", 0))
+        mean_fiat = float(feature_row.get("mean_fiat", 0))
+        min_fiat = float(feature_row.get("min_fiat", 0))
+        mean_biat = float(feature_row.get("mean_biat", 0))
+        min_biat = float(feature_row.get("min_biat", 0))
+        mean_active = float(feature_row.get("mean_active", 0))
+        mean_idle = float(feature_row.get("mean_idle", 0))
         prompt = (
             f"This network flow lasts for {duration:.1f} seconds. "
             f"It shows an average of {get_formatted_feature_value('flowPktsPerSecond', pkts_per_sec, '.2f', ' packets per second')} and {get_formatted_feature_value('flowBytesPerSecond', bytes_per_sec, '.2f', ' bytes per second')}. "
@@ -39,10 +35,23 @@ def convert_feature_to_prompt_text(dataset_name, feature_row) -> str:
             f"The mean backward inter-arrival time range from {get_formatted_feature_value('min_biat', min_biat, '.3f', 's')} to {get_formatted_feature_value('mean_biat', mean_biat, '.3f', 's')} on average."
             f"It includes active periods averaging {mean_active:.3f}s and idle periods around {mean_idle:.3f}s."
         )
-            # f"This network flow lasts for {duration:.1f} seconds. "
-            # f"It shows an average of {pkts_per_sec:.2f} packets per second and {bytes_per_sec:.2f} bytes per second. "
-            # f"The mean forward inter-arrival time range from {min_fiat:.3f}s to {mean_fiat:.3f}s on average."
-            # f"The mean backward inter-arrival times range from {min_biat:.3f}s to {mean_biat:.3f}s."
+    elif dataset_name == "ISCXTor2016":
+        duration = float(feature_row.get("Flow Duration", 0))
+        pkts_per_sec = float(feature_row.get("Flow Packets/s", 0))
+        bytes_per_sec = float(feature_row.get("Flow Bytes/s", 0))
+        mean_fwd_iat = float(feature_row.get("Fwd IAT Mean", 0))
+        min_fwd_iat = float(feature_row.get("Fwd IAT Min", 0))
+        mean_bwd_iat = float(feature_row.get("Bwd IAT Mean", 0))
+        min_bwd_iat = float(feature_row.get("Bwd IAT Min", 0)) 
+        mean_active = float(feature_row.get("Active Mean", 0))
+        mean_idle = float(feature_row.get("Idle Mean", 0))
+        prompt = (
+            f"This network flow lasts for {duration:.1f} seconds. "
+            f"It shows an average of {get_formatted_feature_value('Flow Packets/s', pkts_per_sec, '.2f', ' packets per second')} and {get_formatted_feature_value('Flow Bytes/s', bytes_per_sec, '.2f', ' bytes per second')}. "
+            f"The mean forward inter-arrival time range from {get_formatted_feature_value('Fwd IAT Min', min_fwd_iat, '.3f', 's')} to {get_formatted_feature_value('Fwd IAT Mean', mean_fwd_iat, '.3f', 's')} on average."
+            f"The mean backward inter-arrival time range from {get_formatted_feature_value('Bwd IAT Min', min_bwd_iat, '.3f', 's')} to {get_formatted_feature_value('Bwd IAT Mean', mean_bwd_iat, '.3f', 's')} on average."
+            f"It includes active periods averaging {get_formatted_feature_value('Active Mean', mean_active, '.3f', 's')} and idle periods around {get_formatted_feature_value('Idle Mean', mean_idle, '.3f', 's')}."
+        )
     return prompt
 
 

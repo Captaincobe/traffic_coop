@@ -1,3 +1,5 @@
+# utils/load_data.py
+
 import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -11,6 +13,7 @@ from utils.Dataloader import LLMCSVTrafficDataset, convert_feature_to_prompt_tex
 def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_labels_to_exclude=None):
     max_seq_len_for_llm = args.MAX_SEQ_LENGTH
     dataset_name = args.dataset_name
+    num_samples_per_class = args.SAMPLES_PER_CLASS # 获取新参数
 
     if ood_labels_to_exclude is None:
         ood_labels_to_exclude = []
@@ -19,8 +22,11 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
     new_traffic_labels_str = [label for label in full_traffic_labels_list if label in ood_labels_to_exclude]
     dataset_root='/home/icdm/code/trafficCOOP/datasets'
     csv_path = os.path.join(dataset_root, dataset_name, "raw", f"{dataset_name}.csv")
+
     ood_suffix = "_".join(sorted(ood_labels_to_exclude)) if ood_labels_to_exclude else "all_base"
-    cache_file = os.path.join(dataset_root, dataset_name, "raw", f"tokenized_{ood_suffix}.pt")
+
+    cache_file_name = f"tokenized_{ood_suffix}_few_shot_{num_samples_per_class}.pt"
+    cache_file = os.path.join(dataset_root, dataset_name, "raw", cache_file_name)
 
     if os.path.exists(cache_file):
         print(f"Loading tokenized datasets from cache: {cache_file}")
@@ -51,51 +57,71 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
         base_class_global_indices_sorted = sorted([all_class_labels_global_map[l] for l in base_traffic_labels_str])
         
-        df_base_only = df[df['label'].isin(base_traffic_labels_str)].copy()
-        df_new_only = df[df['label'].isin(new_traffic_labels_str)].copy()
+        # --- 针对最终实验设置的数据集划分逻辑 ---
+        # 1. 首先，将原始数据划分为一个用于训练/验证的池子（train_val_pool）和一个完整的测试集（df_test_full）
+        # 保持 train_val_pool 和 test_full 之间的分层抽样
+        min_samples_for_stratify_df = df['label'].value_counts().min() >= 2 and len(df['label'].unique()) > 1
+        df_train_val_pool, df_test_full = train_test_split(
+            df, test_size=0.3, stratify=df['label'] if min_samples_for_stratify_df else None, random_state=42
+        )
 
-        if len(df_base_only) == 0:
-            raise ValueError("No base class data available after excluding OOD labels. Adjust your 'ood_labels_to_exclude' or dataset.")
+        # 2. 从 train_val_pool 中分离出基类和新类
+        df_base_pool = df_train_val_pool[df_train_val_pool['label'].isin(base_traffic_labels_str)].copy()
+        df_new_pool = df_train_val_pool[df_train_val_pool['label'].isin(new_traffic_labels_str)].copy()
 
-        min_samples_base_strat = df_base_only['label'].value_counts().min() >=2 and len(df_base_only['label'].unique()) > 1
-        df_train_decoop, df_base_remaining = train_test_split(df_base_only, test_size=0.3, stratify=df_base_only['label'] if min_samples_base_strat else None, random_state=42) \
-            if len(df_base_only) >= 2 else (df_base_only, pd.DataFrame(columns=df.columns))
+        # 3. 为训练集进行 Few-shot 采样（仅从基类池中）
+        df_train_decoop = pd.DataFrame(columns=df_base_pool.columns) # few-shot train set
+
+        for label_str in base_traffic_labels_str:
+            class_df = df_base_pool[df_base_pool['label'] == label_str]
+            
+            if len(class_df) < num_samples_per_class:
+                print(f"Warning: Not enough samples ({len(class_df)}) for class '{label_str}' to get {num_samples_per_class} for train. Taking all available.")
+                train_samples = class_df.sample(frac=1, random_state=42) # Take all available for train
+            else:
+                train_samples = class_df.sample(n=num_samples_per_class, random_state=42)
+            
+            df_train_decoop = pd.concat([df_train_decoop, train_samples], ignore_index=True)
+
+
+        # 4. 构建最终验证集 (df_val): 包含除了 few-shot 训练样本外，所有剩余的基类样本和所有新类样本
+        # 获取用于 few-shot 训练的样本的原始索引
+        train_indices_used = df_train_decoop.index
+
+        # 从基类池中剔除已用于训练的样本
+        df_remaining_base_for_val = df_base_pool.drop(train_indices_used, errors='ignore') 
         
-        df_mixed_pool = pd.concat([df_base_remaining, df_new_only], ignore_index=True)
-        if len(df_mixed_pool) == 0:
-            print("Warning: Mixed pool empty. Using DECOOP train data for val/test.")
-            min_samples_train_strat = df_train_decoop['label'].value_counts().min() >=2 and len(df_train_decoop['label'].unique()) > 1
-            df_val, df_test = train_test_split(df_train_decoop, test_size=0.5, stratify=df_train_decoop['label'] if min_samples_train_strat else None, random_state=42) \
-                if len(df_train_decoop) >=2 else (df_train_decoop, df_train_decoop)
-        else:
-            min_samples_mixed_strat = df_mixed_pool['label'].value_counts().min() >=2 and len(df_mixed_pool['label'].unique()) > 1
-            df_val, df_test = train_test_split(df_mixed_pool, test_size=0.5, stratify=df_mixed_pool['label'] if min_samples_mixed_strat else None, random_state=42) \
-                if len(df_mixed_pool) >=2 else (df_mixed_pool, df_mixed_pool)
+        # 验证集是剩余的基类样本加上所有新类样本，并打乱
+        df_val = pd.concat([df_remaining_base_for_val, df_new_pool], ignore_index=True).sample(frac=1, random_state=42) 
 
-        print(f"DECOOP Train (Base Classes Only): {len(df_train_decoop)} samples")
-        print(f"Validation (Mixed Classes): {len(df_val)} samples")
-        print(f"Test (Mixed Classes): {len(df_test)} samples")
+        # 5. 将完整的测试集赋值给 df_test
+        df_test = df_test_full
+
+        print(f"DECOOP Few-Shot Train (Base Classes Only): {len(df_train_decoop)} samples")
+        print(f"Final Validation (Mixed Classes for Calibration): {len(df_val)} samples")
+        print(f"Full Test (Mixed Classes): {len(df_test)} samples")
         print(f"Base classes for training: {base_traffic_labels_str}")
         if new_traffic_labels_str:
             print(f"New/OOD classes for evaluation: {new_traffic_labels_str}")
-        # --- 检查 df_val 中的类别分布 ---
-        print("\n--- Checking Class Distribution in Validation Set (df_val) ---")
+        
+        # --- 检查 df_test 中的类别分布 ---
+        print("\n--- Checking Class Distribution in Test Set (df_test) ---")
         
         # 打印字符串标签的计数
-        val_class_counts_str = df_val['label'].value_counts().sort_index()
-        print("Validation set (df_val) class counts (string labels):")
-        print(val_class_counts_str)
+        test_class_counts_str = df_test['label'].value_counts().sort_index()
+        print("Test set (df_test) class counts (string labels):")
+        print(test_class_counts_str)
 
         # 打印全局索引的计数，方便与日志中的 'class X' 对应
-        print("\nValidation set (df_val) class counts (global indices):")
-        global_val_class_counts = {}
-        for label_str, count in val_class_counts_str.items():
+        print("\nTest set (df_test) class counts (global indices):")
+        global_test_class_counts = {}
+        for label_str, count in test_class_counts_str.items():
             global_idx = all_class_labels_global_map.get(label_str)
             if global_idx is not None:
-                global_val_class_counts[global_idx] = count
+                global_test_class_counts[global_idx] = count
         
-        sorted_global_val_class_counts = sorted(global_val_class_counts.items())
-        for global_idx, count in sorted_global_val_class_counts:
+        sorted_global_test_class_counts = sorted(global_test_class_counts.items())
+        for global_idx, count in sorted_global_test_class_counts:
             # 尝试获取本地基类索引，如果它是一个基类的话
             local_base_idx_info = ''
             if global_idx in base_class_global_indices_sorted:
@@ -103,7 +129,7 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             print(f"  Global Class {global_idx}{local_base_idx_info}: {count} samples")
         print("------------------------------------------------------")
 
-        def tokenize_dataframe(dataframe, tokenizer, max_seq_len, all_class_labels_global_map, feature_columns, is_training_data, dataset_name, base_class_global_indices=None):
+        def tokenize_dataframe(dataframe, tokenizer, max_seq_len, all_class_labels_global_map, is_training_data, dataset_name, base_class_global_indices=None):
             tokenized_list = []
             
             global_to_local_base_map = None
@@ -115,7 +141,6 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     raise ValueError("For training data, 'base_class_global_indices' cannot be empty.")
                 global_to_local_base_map = {global_idx: local_idx for local_idx, global_idx in enumerate(sorted_base_class_global_indices)}
 
-            raw_lengths = []
             for idx, row in dataframe.iterrows():
                 global_label_str = row['label']
                 global_label_numerical = all_class_labels_global_map.get(global_label_str)
@@ -123,15 +148,9 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                 if global_label_numerical is None:
                     raise ValueError(f"Label '{global_label_str}' not found in all_class_labels_global_map for row index {idx}.")
 
-
                 feature_text = convert_feature_to_prompt_text(dataset_name, row)
                 prompt_prefix = "Traffic classification sample:"
                 full_input = f"{prompt_prefix} {feature_text}"
-
-                # print(f"DEBUG: prompt_prefix type: {type(prompt_prefix)}, value: '{prompt_prefix}'")
-                # print(f"DEBUG: feature_text type: {type(feature_text)}, value: '{feature_text}'")
-                # print(f"DEBUG: full_input type: {type(full_input)}, value: '{full_input}'")
-
 
                 tokenized = tokenizer(
                     full_input,
@@ -140,15 +159,6 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     padding="max_length",
                     return_tensors="pt"
                 )
-
-                # decoded_original_data = tokenizer.decode(tokenized['input_ids'][0], skip_special_tokens=True)
-                # print(f"DEBUG: Decoded (from tokenizer): '{decoded_original_data}'")
-                # tokenized = tokenizer(
-                #     full_input,
-                #     truncation=False, # 不截断
-                #     padding=False,    # 不填充
-                #     return_tensors="pt"
-                # )
 
                 target_label_numerical = global_label_numerical
                 if is_training_data:
@@ -167,23 +177,12 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     "global_labels": torch.tensor(global_label_numerical, dtype=torch.long),
                     "raw_text": full_input
                 })
-                # current_raw_length = tokenized["input_ids"].size(1)
-                # raw_lengths.append(current_raw_length)
-            # if raw_lengths: # 确保列表不为空
-            #     print(f"\n--- Tokenized Length Statistics for this DataFrame ---")
-            #     print(f"  Minimum raw tokenized length: {np.min(raw_lengths)}")
-            #     print(f"  Maximum raw tokenized length: {np.max(raw_lengths)}")
-            #     print(f"  Average raw tokenized length: {np.mean(raw_lengths):.2f}")
-            #     print(f"  95th percentile raw tokenized length: {np.percentile(raw_lengths, 95):.2f}")
-            #     print(f"  Number of samples exceeding current max_seq_len ({max_seq_len}): {sum(1 for l in raw_lengths if l > max_seq_len)}")
-            #     print(f"----------------------------------------------------\n")
-            # # -----------------------------------------
             return tokenized_list
 
 
-        train_tokenized_list = tokenize_dataframe(df_train_decoop, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, feature_cols, is_training_data=True, dataset_name=args.dataset_name, base_class_global_indices=base_class_global_indices_sorted)
-        val_tokenized_list = tokenize_dataframe(df_val, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, feature_cols, is_training_data=False, dataset_name=args.dataset_name)
-        test_tokenized_list = tokenize_dataframe(df_test, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, feature_cols, is_training_data=False, dataset_name=args.dataset_name)
+        train_tokenized_list = tokenize_dataframe(df_train_decoop, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, is_training_data=True, dataset_name=args.dataset_name, base_class_global_indices=base_class_global_indices_sorted)
+        val_tokenized_list = tokenize_dataframe(df_val, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, is_training_data=False, dataset_name=args.dataset_name)
+        test_tokenized_list = tokenize_dataframe(df_test, tokenizer, max_seq_len_for_llm, all_class_labels_global_map, is_training_data=False, dataset_name=args.dataset_name)
 
 
         train_dataset = LLMCSVTrafficDataset(train_tokenized_list)
@@ -200,5 +199,3 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             "ood_labels_excluded": ood_labels_to_exclude
         }, cache_file)
     return train_dataset, val_dataset, test_dataset, args, base_class_global_indices_sorted
-
-

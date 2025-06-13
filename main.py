@@ -18,11 +18,37 @@ DEVICE = args.DEVICE
 ALPHA_CP = args.ALPHA_CP
 dataset_name = args.dataset_name
 
-all_labels_list = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P", "BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"]
+
 if dataset_name == "ISCXVPN2016":
+    all_labels_list = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P", "BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"]
     ood_labels_for_this_run = ["VOIP"] 
     base_traffic_labels_str = all_labels_list
-
+    args.LABEL_TOKEN_MAP={"BROWSING": "web",         
+        "CHAT": "chat",           
+        "VOIP": "call",            
+        "P2P": "sharing",          
+        "MAIL": "mail",          
+        "STREAMING": "stream",      
+        "VPN-BROWSING": "vpnweb",  
+        "VPN-CHAT": "vpnchat",     
+        "VPN-FT": "vpnftp",        
+        "VPN-MAIL": "vpnmail",    
+        "VPN-P2P": "vpnshare",     
+        "VPN-STREAMING": "vpnvideo", 
+        "VPN-VOIP": "vpncall",     
+        "FT": "ftp"}
+elif dataset_name == "ISCXTor2016":
+    all_labels_list = ['AUDIO', 'BROWSING', 'CHAT', 'FILE-TRANSFER', 'MAIL', 'P2P', 'VIDEO', 'VOIP']
+    ood_labels_for_this_run = ["VOIP"] 
+    base_traffic_labels_str = all_labels_list
+    args.LABEL_TOKEN_MAP={"AUDIO": "audio",         
+        "VIDEO": "video",         
+        "FILE-TRANSFER": "file",         
+        "BROWSING": "web",         
+        "CHAT": "chat",           
+        "VOIP": "call",            
+        "P2P": "sharing",          
+        "MAIL": "mail"}
 
 # 给 每个 标签一个唯一数字 0‒(C-1)，无论它是基类还新类 整个项目只此一份；一旦确定就不会再变
 all_class_labels_global_map = {label: i for i, label in enumerate(all_labels_list)}
@@ -31,7 +57,13 @@ print(f"Device: {DEVICE}")
 
 train_dataset, val_dataset, test_dataset, args, base_class_indices_num_sorted = loadData(
     args, base_traffic_labels_str, all_class_labels_global_map, ood_labels_to_exclude=ood_labels_for_this_run)
-
+print(f"Train: {len(train_dataset)} samples")
+print(f"Val: {len(val_dataset)} samples")
+print(f"Test: {len(test_dataset)} samples")
+# a part of sample
+indices = torch.randperm(len(train_dataset))[:4096]
+train_dataset_subset = torch.utils.data.Subset(train_dataset, indices)
+train_dataset = train_dataset_subset
 
 NUM_BASE_CLASSES = args.NUM_BASE_CLASSES
 NUM_ALL_CLASSES = args.NUM_ALL_CLASSES

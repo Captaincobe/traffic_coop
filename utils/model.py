@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.nn.functional import softmax, cross_entropy
-from transformers import AutoModel
+from transformers import AutoModel # Keep AutoTokenizer, AutoModelForMaskedLM for MLMZeroShotClassifier
 from utils.utils import kl_divergence_loss_from_logits
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
+from peft import LoraConfig, get_peft_model, TaskType
+
 class MLMZeroShotClassifier:
     def __init__(self, model_name, label_token_map, template="This traffic is [MASK].", device="cuda"):
         from transformers import AutoTokenizer, AutoModelForMaskedLM
@@ -248,15 +250,37 @@ class LLMTrafficDECOOP(nn.Module):
         self.device = args.DEVICE
         self.k_detectors = args.K_DETECTORS
         self.PROMPT_LENGTH = args.PROMPT_LENGTH
-        # -------------------- Shared Encoder (frozen) --------------------
+        # -------------------- Shared Encoder (LoRA) --------------------
         self.shared_encoder = AutoModel.from_pretrained(
             self.llm_model_name,
             torch_dtype=torch.float32,
-            # low_cpu_mem_usage=True
+            # low_cpu_mem_usage=True # 如果内存紧张可以打开
         ).to(self.device)
 
-        for param in self.shared_encoder.parameters():
-            param.requires_grad = False
+        # 定义LoRA配置
+        # r: LoRA的秩，通常是8、16、32、64
+        # lora_alpha: LoRA的缩放因子
+        # target_modules: 指定要应用LoRA的模块。对于RoBERTa，常见的选择是query和value投影层。
+        # TaskType: 对于Encoder-only模型，通常是TaskType.FEATURE_EXTRACTION或TaskType.SEQ_CLS
+        lora_config = LoraConfig(
+            r=8,  # 可以从args中读取，或根据实验调整
+            lora_alpha=16, # 可以从args中读取，或根据实验调整
+            target_modules=["query", "value"], # RoBERTa模型中的注意力层投影名称
+            lora_dropout=0.1, # 可以从args中读取，或根据实验调整
+            bias="none", # 通常设置为"none"
+            task_type=TaskType.FEATURE_EXTRACTION, # 适合抽取特征的任务
+        )
+
+        # 应用LoRA到共享编码器
+        self.shared_encoder = get_peft_model(self.shared_encoder, lora_config)
+        # LoRA会自动冻结原始模型参数，并使LoRA适配器可训练，因此不再需要手动冻结
+        # for param in self.shared_encoder.parameters():
+        #     param.requires_grad = False # <-- 删除这行，LoRA会处理参数冻结
+
+        print(f"Applied LoRA to {self.llm_model_name}. Trainable parameters (LoRA + Head):")
+        self.shared_encoder.print_trainable_parameters() # 打印可训练参数量
+
+
         # Embeddings remain frozen for efficiency
         self.hidden_dim = self.shared_encoder.config.hidden_size
 
@@ -367,12 +391,13 @@ class LLMTrafficDECOOP(nn.Module):
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
-
         # Keep encoder frozen to save memory; only train prompt & classifier
         self.prompt_manager.train()
+        self.shared_encoder.train() # LoRA适配器需要设为train模式才能启用dropout
 
         optimizer = torch.optim.AdamW(
-            self.prompt_manager.get_ood_parameters_k(k),
+            self.prompt_manager.get_ood_parameters_k(k)+
+            list(self.shared_encoder.parameters()),
             lr=learning_rate
         )
         loss_fn = nn.CrossEntropyLoss()
@@ -452,8 +477,12 @@ class LLMTrafficDECOOP(nn.Module):
                 # optimizer.step()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer) 
-                torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 梯度裁剪
-
+                # torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.prompt_manager.get_ood_parameters_k(k)) + \
+                    list(self.shared_encoder.parameters()), # <-- LoRA
+                    max_norm=1.0
+                )
                 scaler.step(optimizer) 
                 scaler.update()              
 
@@ -466,8 +495,13 @@ class LLMTrafficDECOOP(nn.Module):
             print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
 
         # ---- freeze the k‑th OOD prompt after finishing training ----
+        # Prompt Manager 的软提示参数应该在训练结束后被冻结，以便后续被其他检测器使用
         for p in self.prompt_manager.ood_prompts[k].parameters():
             p.requires_grad = False
+        # LoRA适配器通常在训练完所有阶段后才考虑冻结
+        # 如果你希望每个k训练完就冻结，可以加上类似下面的逻辑，但一般不这么做
+        # for param in self.shared_encoder.parameters():
+        #     param.requires_grad = False 
     
     def fit_sub_classifiers(self, train_dataset):
         batch_size = self.args.BATCH_SIZE
@@ -479,9 +513,13 @@ class LLMTrafficDECOOP(nn.Module):
 
         for k in range(self.k_detectors):
             print(f"\n[Training Sub-classifier + COOP Prompt #{k}]")
+            self.prompt_manager.train()
+            self.shared_encoder.train() # LoRA适配器需要设为train模式
             optimizer = torch.optim.AdamW(
-                self.prompt_manager.get_coop_parameters_k(k) +
-                list(self.sub_classifiers_[k].parameters()),
+                # 训练COOP Prompt Manager的参数，Sub-classifier的参数，以及共享编码器的LoRA适配器
+                list(self.prompt_manager.get_coop_parameters_k(k)) +
+                list(self.sub_classifiers_[k].parameters()) +
+                list(self.shared_encoder.parameters()), # <-- 新增这行，包含LoRA参数
                 lr=learning_rate
             )
             # === 学习率调度器设置 (针对 fit_sub_classifiers 方法) ===
@@ -559,7 +597,9 @@ class LLMTrafficDECOOP(nn.Module):
                     # 梯度裁剪
                     scaler.unscale_(optimizer) # 在裁剪前unscale
                     torch.nn.utils.clip_grad_norm_(
-                        self.prompt_manager.get_coop_parameters_k(k) + list(self.sub_classifiers_[k].parameters()),
+                        list(self.prompt_manager.get_coop_parameters_k(k)) +
+                        list(self.sub_classifiers_[k].parameters()) +
+                        list(self.shared_encoder.parameters()), # <-- 包含LoRA参数
                         max_norm=1.0
                     )
 
@@ -576,7 +616,9 @@ class LLMTrafficDECOOP(nn.Module):
             # ---- freeze the k‑th COOP prompt after training ----
             for p in self.prompt_manager.coop_prompts[k].parameters():
                 p.requires_grad = False
-
+            # LoRA适配器通常在所有阶段训练完才考虑冻结
+            # for param in self.shared_encoder.parameters():
+            #     param.requires_grad = False
 
 class DECOOPInferenceEngine:
     def __init__(self, model, eci_thresholds):
@@ -633,7 +675,7 @@ class DECOOPInferenceEngine:
             n_val = len(all_non_conformity_scores_val)
             q_level = np.ceil((n_val + 1) * (1 - alpha_cp)) / n_val
             q_hat = np.quantile(all_non_conformity_scores_val, q_level) if n_val > 0 else 0.9
-
+        print(all_non_conformity_scores_val)
         # 将计算出的 q_hat 设置到模型的参数中
         self.model.args.CP_OOD_THRESHOLD = q_hat
         print(f"Validation complete. q_hat = {q_hat:.4f}")

@@ -7,26 +7,32 @@ def parameter_parser():
     parser.add_argument('--num_all_classes', dest='NUM_ALL_CLASSES', type=int, default=-1)
     parser.add_argument('--label_map', dest='LABEL_TOKEN_MAP', default=
     {
+        "AUDIO": "audio",         
+        "VIDEO": "video",         
+        "FILE-TRANSFER": "file",         
         "BROWSING": "web",         
         "CHAT": "chat",           
         "VOIP": "call",            
         "P2P": "sharing",          
-        "MAIL": "email",           
-        "STREAMING": "video",      
-        "VPN-BROWSING": "webvpn",  
-        "VPN-CHAT": "chatvpn",     
-        "VPN-FT": "ftpvpn",        
-        "VPN-MAIL": "mailvpn",    
-        "VPN-P2P": "sharevpn",     
-        "VPN-STREAMING": "videovpn", 
-        "VPN-VOIP": "callvpn",     
-        "FT": "ft"         
-    })
+        "MAIL": "mail",          
+        "STREAMING": "stream",      
+        "VPN-BROWSING": "vpnweb",  
+        "VPN-CHAT": "vpnchat",     
+        "VPN-FT": "vpnftp",        
+        "VPN-MAIL": "vpnmail",    
+        "VPN-P2P": "vpnshare",     
+        "VPN-STREAMING": "vpnvideo", 
+        "VPN-VOIP": "vpncall",     
+        "FT": "ftp"
+    }) 
     parser.add_argument('--dataset_name', type=str, default='ISCXVPN2016',
                         choices=["ISCXVPN2016", "ISCXTor2016", "USTC-TFC2016", "CIC-Darknet2020"])
+    # Few-shot training parameter
+    parser.add_argument('--samples_per_class', dest='SAMPLES_PER_CLASS', type=int, default=200,
+                        help='Number of samples per base class for few-shot training.')
 
-    parser.add_argument('--llm', dest='LLM_MODEL_NAME', type=str, default="FacebookAI/roberta-base",
-                        choices=["Qwen/Qwen2.5-7B-Instruct","bert-base-uncased","FacebookAI/roberta-base"],
+    parser.add_argument('--LLM_MODEL_NAME', type=str, default="FacebookAI/roberta-base",
+                        choices=["bert-base-uncased","FacebookAI/roberta-base"],
                         help='Name of the pre-trained LLM model to use.')
     parser.add_argument('--device', dest='DEVICE', type=str, default="cuda",
                     help='Device to use for training (e.g., "cuda" or "cpu").')
@@ -35,25 +41,23 @@ def parameter_parser():
     parser.add_argument('--prompt_len', dest='PROMPT_LENGTH', type=int, default=30)
     parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
                         help='Number of detectors per DECOOP paper (often K=3).')
-
-    
     parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
-    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-5,
-                        help='Learning rate for the LLM backbone.')
-    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-2,
+    
+    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=1e-3)
+    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=1e-6,
                         help='Learning rate for the classification head.')
 
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=30,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=100,
                         help='Number of epochs for Detector training.')
-    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=5,
+    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=10,
                         help='Number of epochs for Subclassifier training.')
 
 
     # OOD/ID Loss Regularization
-    parser.add_argument("--OOD_MARGIN", type=float, default=0.5,
+    parser.add_argument("--OOD_MARGIN", type=float, default=0.05,
                         help="Margin for the entropy-based OOD loss.")
-    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.05, # 熵正则化系数，尝试0.01到0.1
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.1, # 熵正则化系数，尝试0.01到0.1
                         help="Weight for the entropy regularization term in OOD prompt training.")
     parser.add_argument("--KL_COEFF", type=float, default=0.1, # KL散度损失系数，用于COOP训练
                         help="Coefficient for KL divergence loss in COOP prompt training.")
@@ -61,7 +65,7 @@ def parameter_parser():
     #  Conformal Prediction Thresholds
     parser.add_argument("--CP_OOD_THRESHOLD", type=float, default=0.9, # 这是一个校准后的值，这里是初始默认值
                     help="Conformal prediction OOD threshold. Will be calibrated during ECI.")
-    parser.add_argument('--ALPHA_CP', type=float, default=0.2,
+    parser.add_argument('--ALPHA_CP', type=float, default=0.1,
                         help='Alpha parameter for confidence penalty.')
 
 
