@@ -117,7 +117,7 @@ class SharedRoBERTaPromptLearner(nn.Module):
     def __init__(self, prompt_length, embedding_dim):
         super().__init__()
         self.prompt_length = prompt_length
-        self.prompt_embedding = nn.Parameter(torch.empty(prompt_length, embedding_dim, dtype=torch.bfloat16))
+        self.prompt_embedding = nn.Parameter(torch.empty(prompt_length, embedding_dim, dtype=torch.float32))
         # nn.init.kaiming_normal_(self.prompt_embedding,nonlinearity='leaky_relu') # xavier_normal_
         nn.init.normal_(self.prompt_embedding, std=0.02)
         self.ln = nn.LayerNorm(embedding_dim)
@@ -144,7 +144,7 @@ class PromptLearnerManager(nn.Module):
         self.coop_prompts = nn.ModuleList([
             SharedRoBERTaPromptLearner(prompt_length, self.embedding_dim) for _ in range(K)
         ])
-        self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.bfloat16)
+        self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.float32)
 
     def _forward_with_prompt(self, prompt_module, input_ids, attention_mask):
 
@@ -173,7 +173,6 @@ class PromptLearnerManager(nn.Module):
         prompt_bank = prompt_bank.unsqueeze(1).expand(-1, B, -1, -1)     # (K,B,Lp,H)
         prompt_bank = prompt_bank.reshape(B*K, self.prompt_length, -1)   # (B·K,Lp,H)
 
-        # word embeddings (no_grad)
         with torch.no_grad():
             tok_embeds = self.encoder.embeddings(input_ids)              # (B,L,H)
         tok_embeds = tok_embeds.unsqueeze(0).expand(K, -1, -1, -1)       # (K,B,L,H)
@@ -252,7 +251,7 @@ class LLMTrafficDECOOP(nn.Module):
         # -------------------- Shared Encoder (frozen) --------------------
         self.shared_encoder = AutoModel.from_pretrained(
             self.llm_model_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             # low_cpu_mem_usage=True
         ).to(self.device)
 
@@ -377,16 +376,13 @@ class LLMTrafficDECOOP(nn.Module):
             lr=learning_rate
         )
         loss_fn = nn.CrossEntropyLoss()
-        # === 学习率调度器设置 (针对 fit 方法) ===
         num_training_steps = len(dataloader) * self.args.NUM_EPOCHS # 总步数
 
         if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-            # 线性预热的 Lambda 函数
             warmup_steps = int(num_training_steps * self.args.WARMUP_EPOCHS / self.args.NUM_EPOCHS)
             def lr_lambda(current_step: int):
                 if current_step < warmup_steps:
                     return float(current_step) / float(max(1, warmup_steps))
-                # 余弦衰减，从预热结束后的学习率开始衰减
                 progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
                 return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
@@ -394,25 +390,23 @@ class LLMTrafficDECOOP(nn.Module):
         elif self.args.LR_SCHEDULER_TYPE == "plateau":
             scheduler = ReduceLROnPlateau(
                 optimizer,
-                mode='min', # 监控损失
+                mode='min',
                 factor=self.args.PLATEAU_FACTOR,
                 patience=self.args.PLATEAU_PATIENCE,
                 verbose=True
             )
             print(f"[Info] Using ReduceLROnPlateau for OOD prompt {k}.")
-        else:
-            scheduler = None # 不使用调度器
-            print("[Info] No LR scheduler applied for OOD prompt training.")
         scaler = GradScaler()
 
         for epoch in range(self.args.NUM_EPOCHS):
             total_loss = 0
             total_correct = 0
             total_id = 0
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
+
                 optimizer.zero_grad()
                 with autocast():
                     logits = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
@@ -437,25 +431,31 @@ class LLMTrafficDECOOP(nn.Module):
                 else:
                     loss_id = torch.tensor(0.0, device=self.device, requires_grad=True)
 
+
+                loss_margin = torch.tensor(0.0, device=self.device) # Ensure requires_grad=False by default with AMP
                 if is_ood.any() and is_id.any():
                     entropy_id = entropy[is_id].mean()
                     entropy_ood = entropy[is_ood].mean()
                     loss_margin = torch.clamp(self.args.OOD_MARGIN + entropy_id - entropy_ood, min=0.0)
-                else:
-                    loss_margin = torch.tensor(0.0, device=self.device, requires_grad=True)
+                elif is_ood.any(): # Only OOD samples in batch
+                    entropy_ood = entropy[is_ood].mean()
+                elif is_id.any(): # Only ID samples in batch
+                    entropy_id = entropy[is_id].mean()
+
 
                 loss = loss_id + self.args.LAMBDA_ENTROPY * loss_margin
+
 
                 # optimizer.zero_grad()
                 # loss.backward()
                 # # torch.nn.utils.clip_grad_norm_(self.prompt_manager.parameters(), max_norm=1.0)
                 # optimizer.step()
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer) # 在裁剪前unscale
-                torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 应用梯度裁剪
+                scaler.unscale_(optimizer) 
+                torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 梯度裁剪
 
-                scaler.step(optimizer)       # 使用 scaler.step()
-                scaler.update()              # 使用 scaler.update()
+                scaler.step(optimizer) 
+                scaler.update()              
 
                 if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
                     scheduler.step() # CosineAnnealingLR是按步更新

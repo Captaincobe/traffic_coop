@@ -103,7 +103,6 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             print(f"  Global Class {global_idx}{local_base_idx_info}: {count} samples")
         print("------------------------------------------------------")
 
-        # --- 进行分词操作，将结果保存为列表 ---
         def tokenize_dataframe(dataframe, tokenizer, max_seq_len, all_class_labels_global_map, feature_columns, is_training_data, dataset_name, base_class_global_indices=None):
             tokenized_list = []
             
@@ -126,9 +125,13 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
 
                 feature_text = convert_feature_to_prompt_text(dataset_name, row)
-
                 prompt_prefix = "Traffic classification sample:"
                 full_input = f"{prompt_prefix} {feature_text}"
+
+                # print(f"DEBUG: prompt_prefix type: {type(prompt_prefix)}, value: '{prompt_prefix}'")
+                # print(f"DEBUG: feature_text type: {type(feature_text)}, value: '{feature_text}'")
+                # print(f"DEBUG: full_input type: {type(full_input)}, value: '{full_input}'")
+
 
                 tokenized = tokenizer(
                     full_input,
@@ -137,6 +140,9 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                     padding="max_length",
                     return_tensors="pt"
                 )
+
+                # decoded_original_data = tokenizer.decode(tokenized['input_ids'][0], skip_special_tokens=True)
+                # print(f"DEBUG: Decoded (from tokenizer): '{decoded_original_data}'")
                 # tokenized = tokenizer(
                 #     full_input,
                 #     truncation=False, # 不截断

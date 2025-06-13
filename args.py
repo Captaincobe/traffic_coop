@@ -32,7 +32,7 @@ def parameter_parser():
                     help='Device to use for training (e.g., "cuda" or "cpu").')
     parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=128,
                     help='Maximum sequence length for LLM input.') # 1: 128, 
-    parser.add_argument('--prompt_len', dest='PROMPT_LENGTH', type=float, default=10)
+    parser.add_argument('--prompt_len', dest='PROMPT_LENGTH', type=int, default=30)
     parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
                         help='Number of detectors per DECOOP paper (often K=3).')
 
@@ -41,19 +41,19 @@ def parameter_parser():
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-5,
                         help='Learning rate for the LLM backbone.')
-    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-4,
+    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-2,
                         help='Learning rate for the classification head.')
 
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=20,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=30,
                         help='Number of epochs for Detector training.')
-    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=20,
+    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=5,
                         help='Number of epochs for Subclassifier training.')
 
 
     # OOD/ID Loss Regularization
     parser.add_argument("--OOD_MARGIN", type=float, default=0.5,
                         help="Margin for the entropy-based OOD loss.")
-    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.01, # 熵正则化系数，尝试0.01到0.1
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.05, # 熵正则化系数，尝试0.01到0.1
                         help="Weight for the entropy regularization term in OOD prompt training.")
     parser.add_argument("--KL_COEFF", type=float, default=0.1, # KL散度损失系数，用于COOP训练
                         help="Coefficient for KL divergence loss in COOP prompt training.")
