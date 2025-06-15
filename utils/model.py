@@ -146,8 +146,13 @@ class PromptLearnerManager(nn.Module):
         self.coop_prompts = nn.ModuleList([
             SharedRoBERTaPromptLearner(prompt_length, self.embedding_dim) for _ in range(K)
         ])
-        self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.float32)
-
+        # self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.float32)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.ReLU(),                               
+            nn.Dropout(0.2),                      
+            nn.Linear(self.embedding_dim // 2, num_labels) 
+        )
     def _forward_with_prompt(self, prompt_module, input_ids, attention_mask):
 
         batch_size = input_ids.size(0)
@@ -156,7 +161,7 @@ class PromptLearnerManager(nn.Module):
         prompt_mask = torch.ones((batch_size, self.prompt_length), dtype=attention_mask.dtype).to(attention_mask.device)
         full_mask = torch.cat([prompt_mask, attention_mask], dim=1)
         outputs = self.encoder(inputs_embeds=full_embeds, attention_mask=full_mask)
-        cls_token = outputs.last_hidden_state[:, 0]
+        cls_token = outputs.last_hidden_state[:, 0] 
         logits = self.classifier(cls_token)
         # logits = torch.clamp(logits, min=-10, max=10)
         return logits
@@ -258,7 +263,7 @@ class LLMTrafficDECOOP(nn.Module):
         ).to(self.device)
 
         for param in self.shared_encoder.parameters():
-            param.requires_grad = False # <-- 删除这行，LoRA会处理参数冻结
+            param.requires_grad = False #
 
         # Embeddings remain frozen for efficiency
         self.hidden_dim = self.shared_encoder.config.hidden_size
@@ -454,12 +459,8 @@ class LLMTrafficDECOOP(nn.Module):
                 # optimizer.step()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer) 
-                # torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.prompt_manager.get_ood_parameters_k(k)) + \
-                    list(self.shared_encoder.parameters()), # <-- LoRA
-                    max_norm=1.0
-                )
+                torch.nn.utils.clip_grad_norm_(self.prompt_manager.get_ood_parameters_k(k), max_norm=1.0) # 梯度裁剪
+
                 scaler.step(optimizer) 
                 scaler.update()              
 
@@ -469,7 +470,7 @@ class LLMTrafficDECOOP(nn.Module):
 
             avg_loss = total_loss / len(dataloader)
             acc = total_correct / total_id if total_id > 0 else 0.0
-            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
+            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Loss_id: {loss_id:4.f} | Loss_margin: {loss_margin:4.f} | Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
 
         # ---- freeze the k‑th OOD prompt after finishing training ----
         for p in self.prompt_manager.ood_prompts[k].parameters():

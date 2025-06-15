@@ -57,7 +57,7 @@ def parameter_parser():
     # OOD/ID Loss Regularization
     parser.add_argument("--OOD_MARGIN", type=float, default=0.2,
                         help="Margin for the entropy-based OOD loss.")
-    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.01, # 熵正则化系数，尝试0.01到0.1
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.05, # 熵正则化系数，尝试0.01到0.1
                         help="Weight for the entropy regularization term in OOD prompt training.")
     parser.add_argument("--KL_COEFF", type=float, default=0.4, # KL散度损失系数，用于COOP训练
                         help="Coefficient for KL divergence loss in COOP prompt training.")
