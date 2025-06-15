@@ -7,7 +7,7 @@ from utils.utils import kl_divergence_loss_from_logits
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
-from peft import LoraConfig, get_peft_model, TaskType
+
 
 class MLMZeroShotClassifier:
     def __init__(self, model_name, label_token_map, template="This traffic is [MASK].", device="cuda"):
@@ -257,29 +257,8 @@ class LLMTrafficDECOOP(nn.Module):
             # low_cpu_mem_usage=True # 如果内存紧张可以打开
         ).to(self.device)
 
-        # 定义LoRA配置
-        # r: LoRA的秩，通常是8、16、32、64
-        # lora_alpha: LoRA的缩放因子
-        # target_modules: 指定要应用LoRA的模块。对于RoBERTa，常见的选择是query和value投影层。
-        # TaskType: 对于Encoder-only模型，通常是TaskType.FEATURE_EXTRACTION或TaskType.SEQ_CLS
-        lora_config = LoraConfig(
-            r=8,  # 可以从args中读取，或根据实验调整
-            lora_alpha=16, # 可以从args中读取，或根据实验调整
-            target_modules=["query", "value"], # RoBERTa模型中的注意力层投影名称
-            lora_dropout=0.1, # 可以从args中读取，或根据实验调整
-            bias="none", # 通常设置为"none"
-            task_type=TaskType.FEATURE_EXTRACTION, # 适合抽取特征的任务
-        )
-
-        # 应用LoRA到共享编码器
-        self.shared_encoder = get_peft_model(self.shared_encoder, lora_config)
-        # LoRA会自动冻结原始模型参数，并使LoRA适配器可训练，因此不再需要手动冻结
-        # for param in self.shared_encoder.parameters():
-        #     param.requires_grad = False # <-- 删除这行，LoRA会处理参数冻结
-
-        print(f"Applied LoRA to {self.llm_model_name}. Trainable parameters (LoRA + Head):")
-        self.shared_encoder.print_trainable_parameters() # 打印可训练参数量
-
+        for param in self.shared_encoder.parameters():
+            param.requires_grad = False # <-- 删除这行，LoRA会处理参数冻结
 
         # Embeddings remain frozen for efficiency
         self.hidden_dim = self.shared_encoder.config.hidden_size
@@ -393,11 +372,9 @@ class LLMTrafficDECOOP(nn.Module):
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
         # Keep encoder frozen to save memory; only train prompt & classifier
         self.prompt_manager.train()
-        self.shared_encoder.train() # LoRA适配器需要设为train模式才能启用dropout
 
         optimizer = torch.optim.AdamW(
-            self.prompt_manager.get_ood_parameters_k(k)+
-            list(self.shared_encoder.parameters()),
+            self.prompt_manager.get_ood_parameters_k(k),
             lr=learning_rate
         )
         loss_fn = nn.CrossEntropyLoss()
@@ -495,13 +472,9 @@ class LLMTrafficDECOOP(nn.Module):
             print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
 
         # ---- freeze the k‑th OOD prompt after finishing training ----
-        # Prompt Manager 的软提示参数应该在训练结束后被冻结，以便后续被其他检测器使用
         for p in self.prompt_manager.ood_prompts[k].parameters():
             p.requires_grad = False
-        # LoRA适配器通常在训练完所有阶段后才考虑冻结
-        # 如果你希望每个k训练完就冻结，可以加上类似下面的逻辑，但一般不这么做
-        # for param in self.shared_encoder.parameters():
-        #     param.requires_grad = False 
+
     
     def fit_sub_classifiers(self, train_dataset):
         batch_size = self.args.BATCH_SIZE
@@ -514,12 +487,10 @@ class LLMTrafficDECOOP(nn.Module):
         for k in range(self.k_detectors):
             print(f"\n[Training Sub-classifier + COOP Prompt #{k}]")
             self.prompt_manager.train()
-            self.shared_encoder.train() # LoRA适配器需要设为train模式
             optimizer = torch.optim.AdamW(
                 # 训练COOP Prompt Manager的参数，Sub-classifier的参数，以及共享编码器的LoRA适配器
                 list(self.prompt_manager.get_coop_parameters_k(k)) +
-                list(self.sub_classifiers_[k].parameters()) +
-                list(self.shared_encoder.parameters()), # <-- 新增这行，包含LoRA参数
+                list(self.sub_classifiers_[k].parameters()),
                 lr=learning_rate
             )
             # === 学习率调度器设置 (针对 fit_sub_classifiers 方法) ===
@@ -598,8 +569,7 @@ class LLMTrafficDECOOP(nn.Module):
                     scaler.unscale_(optimizer) # 在裁剪前unscale
                     torch.nn.utils.clip_grad_norm_(
                         list(self.prompt_manager.get_coop_parameters_k(k)) +
-                        list(self.sub_classifiers_[k].parameters()) +
-                        list(self.shared_encoder.parameters()), # <-- 包含LoRA参数
+                        list(self.sub_classifiers_[k].parameters()),
                         max_norm=1.0
                     )
 
@@ -616,9 +586,7 @@ class LLMTrafficDECOOP(nn.Module):
             # ---- freeze the k‑th COOP prompt after training ----
             for p in self.prompt_manager.coop_prompts[k].parameters():
                 p.requires_grad = False
-            # LoRA适配器通常在所有阶段训练完才考虑冻结
-            # for param in self.shared_encoder.parameters():
-            #     param.requires_grad = False
+
 
 class DECOOPInferenceEngine:
     def __init__(self, model, eci_thresholds):
@@ -723,48 +691,48 @@ class DECOOPInferenceEngine:
                 pred_types.append("NEW" if is_new_sample else "ID")
             
             # --- 批量处理 "NEW" 样本 ---
-            if is_new_mask.any():
-                new_sample_indices = torch.where(is_new_mask)[0]
+            # if is_new_mask.any():
+            #     new_sample_indices = torch.where(is_new_mask)[0]
                 
-                if raw_texts is None: 
-                    print("Warning: raw_texts not available in batch for MLMZeroShotClassifier. Using empty strings.")
-                    texts_for_mlm = [""] * len(new_sample_indices)
-                else:
-                    texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
+            #     if raw_texts is None: 
+            #         print("Warning: raw_texts not available in batch for MLMZeroShotClassifier. Using empty strings.")
+            #         texts_for_mlm = [""] * len(new_sample_indices)
+            #     else:
+            #         texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
                 
-                zs_probs_batch, _ = self.model.zs_mlm_classifier.predict(texts_for_mlm) # (Num_new_samples, C_all)
-                # 直接赋值，因为 zs_probs_batch 已经是 C_all 维度
-                prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device) 
+            #     zs_probs_batch, _ = self.model.zs_mlm_classifier.predict(texts_for_mlm) # (Num_new_samples, C_all)
+            #     # 直接赋值，因为 zs_probs_batch 已经是 C_all 维度
+            #     prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device) 
 
-            # --- 批量处理 "ID" 样本 ---
-            if (~is_new_mask).any():
-                id_sample_indices = torch.where(~is_new_mask)[0]
-                
-                logits_coop_all_k = self.model.prompt_manager.forward_coop_batch(
-                    input_ids=input_ids[id_sample_indices],
-                    attention_mask=attention_mask[id_sample_indices]
-                ) # (Num_id_samples, C_base, K)
+            # # --- 批量处理 "ID" 样本 ---
+            # if (~is_new_mask).any():
+            id_sample_indices = torch.where(~is_new_mask)[0]
+            
+            logits_coop_all_k = self.model.prompt_manager.forward_coop_batch(
+                input_ids=input_ids[id_sample_indices],
+                attention_mask=attention_mask[id_sample_indices]
+            ) # (Num_id_samples, C_base, K)
 
-                best_k_for_id_samples = best_k_indices[id_sample_indices]
-                
-                best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
-                
-                selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2) # (Num_id_samples, C_base)
-                
-                probs_id_batch = softmax(selected_coop_logits, dim=1) # (Num_id_samples, C_base)
+            best_k_for_id_samples = best_k_indices[id_sample_indices]
+            
+            best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
+            
+            selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2) # (Num_id_samples, C_base)
+            
+            probs_id_batch = softmax(selected_coop_logits, dim=1) # (Num_id_samples, C_base)
 
-                # 修正：将 C_base 维度的概率映射到 C_all 维度的 prob_vectors 中
-                # 需要确保 self.model.base_global_set 在这里是可用的全局索引列表/张量
-                global_indices_of_base_classes = torch.tensor(
-                    sorted(list(self.model.base_global_set)), # 获取模型最终设置的全局基类索引
-                    dtype=torch.long, device=self.model.device
-                )
-                
-                # 使用高级索引将 C_base 概率赋值到 C_all 维度的正确位置
-                # 例如：prob_vectors[行索引, 列索引] = 值
-                # id_sample_indices[:, None] 扩展为 (Num_id_samples, 1) 用于行索引
-                # global_indices_of_base_classes 包含了列索引
-                prob_vectors[id_sample_indices[:, None], global_indices_of_base_classes] = probs_id_batch.to(self.model.device) 
+            # 修正：将 C_base 维度的概率映射到 C_all 维度的 prob_vectors 中
+            # 需要确保 self.model.base_global_set 在这里是可用的全局索引列表/张量
+            global_indices_of_base_classes = torch.tensor(
+                sorted(list(self.model.base_global_set)), # 获取模型最终设置的全局基类索引
+                dtype=torch.long, device=self.model.device
+            )
+            
+            # 使用高级索引将 C_base 概率赋值到 C_all 维度的正确位置
+            # 例如：prob_vectors[行索引, 列索引] = 值
+            # id_sample_indices[:, None] 扩展为 (Num_id_samples, 1) 用于行索引
+            # global_indices_of_base_classes 包含了列索引
+            prob_vectors[id_sample_indices[:, None], global_indices_of_base_classes] = probs_id_batch.to(self.model.device) 
 
         return pred_types, prob_vectors.cpu().numpy() # 返回预测类型列表和 NumPy 数组
 

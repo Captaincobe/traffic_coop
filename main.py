@@ -9,8 +9,6 @@ from sklearn.preprocessing import label_binarize
 import torchvision
 from args import parameter_parser
 from utils.model import DECOOPInferenceEngine, LLMTrafficDECOOP
-# from utils.loAD import load_and_prepare_data_for_llm
-# from utils.utils import debug_model_training
 torchvision.disable_beta_transforms_warning()
 
 args = parameter_parser()
@@ -74,66 +72,67 @@ print(f"Base class global indices: {base_class_indices_num_sorted}")
 print("\nInitializing and Training model...")
 model_instance = LLMTrafficDECOOP(args)
 model_instance.set_base_class_global_indices(base_class_indices_num_sorted)
+model_save_path = f"./models/{dataset_name}/trained_{args.dataset_name}_{args.SAMPLES_PER_CLASS}.pth"
 
 # debug_model_training(train_dataset, model_instance, base_class_indices_num_sorted)
 
 if __name__ == "__main__":
+    if os.path.exists(model_save_path):
+        model_instance.load_state_dict(torch.load(model_save_path))
+        model_instance.to(DEVICE)
+        model_instance.eval()
+        original_model_base_global_indices_state = list(model_instance.base_class_global_indices)
+        model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
+    else:
+        non_conformity_scores_val = []
 
-    # For collecting entropy scores for CP (This variable is now declared outside the loop to accumulate)
-    non_conformity_scores_val = []
-
-    # Store the original global base class indices as determined by load_data.py
-    original_base_class_global_indices = list(base_class_indices_num_sorted) #
-    np.random.shuffle(original_base_class_global_indices)
-    
-    # Ensure K_DETECTORS does not exceed the number of base classes for meaningful "leave-one-class"
-    if args.K_DETECTORS > len(original_base_class_global_indices):
-        print(f"Warning: K_DETECTORS ({args.K_DETECTORS}) is greater than the number of base classes ({len(original_base_class_global_indices)}). Adjusting K_DETECTORS to {len(original_base_class_global_indices)} for leave-one-class setup.")
-        args.K_DETECTORS = len(original_base_class_global_indices)
-
-    # Store the original model's base class configuration for restoration later
-    original_model_base_global_indices_state = list(model_instance.base_class_global_indices)
-
-    # Loop through each detector, treating a different base class as pseudo-OOD for its training
-    for k in range(args.K_DETECTORS):
-        # The class that will be temporarily considered OOD for detector 'k'
-        # We cycle through the original base classes to assign a unique pseudo-OOD for each detector
-        pseudo_ood_class_global_idx = original_base_class_global_indices[k % len(original_base_class_global_indices)]
+        original_base_class_global_indices = list(base_class_indices_num_sorted) #
+        np.random.shuffle(original_base_class_global_indices)
         
-        # Define the ID classes for *this* detector's training (all original base classes except the pseudo-OOD one)
-        id_classes_for_detector_k_global_indices = [
-            idx for idx in original_base_class_global_indices if idx != pseudo_ood_class_global_idx
-        ]
+        if args.K_DETECTORS > len(original_base_class_global_indices):
+            print(f"Warning: K_DETECTORS ({args.K_DETECTORS}) is greater than the number of base classes ({len(original_base_class_global_indices)}). Adjusting K_DETECTORS to {len(original_base_class_global_indices)} for leave-one-class setup.")
+            args.K_DETECTORS = len(original_base_class_global_indices)
 
-        # Temporarily set the model's base class configuration for the current detector's training/calibration phase
-        # This is crucial for `model.fit` and `model.eci_calibration` to correctly identify ID/OOD.
-        model_instance.set_base_class_global_indices(id_classes_for_detector_k_global_indices)
-        
-        print(f"\n[Training PromptLearner OOD #{k}] Pseudo-OOD class for this detector: {pseudo_ood_class_global_idx}")
-        print(f"  ID classes for this detector: {id_classes_for_detector_k_global_indices}")
-        # Pass the full train_dataset (which contains all original base classes) to the training function.
-        # The `fit` method will use the temporarily set `model_instance.base_global_set`
-        # to distinguish ID samples from the pseudo-OOD samples (the left-out class).
-        print(f"\n[Training PromptLearner OOD #{k}] with {len(train_dataset)} samples (ID and pseudo-OOD determined internally).")
-        model_instance.fit(train_dataset, k=k)
-        
-        # Similarly, pass the full val_dataset for calibration.
-        # `eci_calibration` will also use the temporarily set `model_instance.base_global_set`
-        # to collect non-conformity scores only for the ID samples.
-        model_instance.eci_calibration(val_dataset, k=k, alpha=ALPHA_CP)
+        original_model_base_global_indices_state = list(model_instance.base_class_global_indices)
 
-    model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
-    print(f"\nRestored model's base class configuration to: {model_instance.base_class_global_indices}")
+        for k in range(args.K_DETECTORS):
+            # The class that will be temporarily considered OOD for detector 'k'
+            # We cycle through the original base classes to assign a unique pseudo-OOD for each detector
+            pseudo_ood_class_global_idx = original_base_class_global_indices[k % len(original_base_class_global_indices)]
+            
+            # Define the ID classes for *this* detector's training (all original base classes except the pseudo-OOD one)
+            id_classes_for_detector_k_global_indices = [
+                idx for idx in original_base_class_global_indices if idx != pseudo_ood_class_global_idx
+            ]
 
+            # Temporarily set the model's base class configuration for the current detector's training/calibration phase
+            # This is crucial for `model.fit` and `model.eci_calibration` to correctly identify ID/OOD.
+            model_instance.set_base_class_global_indices(id_classes_for_detector_k_global_indices)
+            
+            print(f"\n[Training PromptLearner OOD #{k}] Pseudo-OOD class for this detector: {pseudo_ood_class_global_idx}")
+            print(f"  ID classes for this detector: {id_classes_for_detector_k_global_indices}")
+            # Pass the full train_dataset (which contains all original base classes) to the training function.
+            # The `fit` method will use the temporarily set `model_instance.base_global_set`
+            # to distinguish ID samples from the pseudo-OOD samples (the left-out class).
+            print(f"\n[Training PromptLearner OOD #{k}] with {len(train_dataset)} samples (ID and pseudo-OOD determined internally).")
+            model_instance.fit(train_dataset, k=k)
+            
+            # Similarly, pass the full val_dataset for calibration.
+            # `eci_calibration` will also use the temporarily set `model_instance.base_global_set`
+            # to collect non-conformity scores only for the ID samples.
+            model_instance.eci_calibration(val_dataset, k=k, alpha=ALPHA_CP)
 
-    model_instance.fit_sub_classifiers(train_dataset)
-    print("LLMTrafficDECOOP Model Training Finished.")
+        model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
+        print(f"\nRestored model's base class configuration to: {model_instance.base_class_global_indices}")
 
-    try:
-        model_save_path = f"./models/{dataset_name}/trained_{args.dataset_name}.pth"
-        torch.save(model_instance.state_dict(), model_save_path) # 包含所有可学习的参数
-    except Exception as e:
-        print(f"Error saving model: {e}")
+        model_instance.fit_sub_classifiers(train_dataset)
+        print("LLMTrafficDECOOP Model Training Finished.")
+
+        try:
+            torch.save(model_instance.state_dict(), model_save_path)
+        except Exception as e:
+            print(f"Error saving model: {e}")
+
 
     # ----------------- Conformal Calibration -----------------
     engine = DECOOPInferenceEngine(model_instance, eci_thresholds=model_instance.eci_thresholds)
@@ -143,7 +142,6 @@ if __name__ == "__main__":
     # 调用 engine 的 calibrate_q_hat 方法进行校准
     engine.calibrate_q_hat(val_dataset, args.ALPHA_CP)
 
-    # 获取测试集预测结果
     point_preds_global, prob_matrix_all_classes, predictions_conformal_sets = \
         engine.predict_batch(test_dataset)
 

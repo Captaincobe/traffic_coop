@@ -24,7 +24,7 @@ def parameter_parser():
         "VPN-STREAMING": "vpnvideo", 
         "VPN-VOIP": "vpncall",     
         "FT": "ftp"
-    }) 
+    })
     parser.add_argument('--dataset_name', type=str, default='ISCXVPN2016',
                         choices=["ISCXVPN2016", "ISCXTor2016", "USTC-TFC2016", "CIC-Darknet2020"])
     # Few-shot training parameter
@@ -44,22 +44,22 @@ def parameter_parser():
     parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
-    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=1e-3)
-    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=1e-6,
+    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=1e-4)
+    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-3,
                         help='Learning rate for the classification head.')
 
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=100,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=400,
                         help='Number of epochs for Detector training.')
-    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=10,
+    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=50,
                         help='Number of epochs for Subclassifier training.')
 
 
     # OOD/ID Loss Regularization
-    parser.add_argument("--OOD_MARGIN", type=float, default=0.05,
+    parser.add_argument("--OOD_MARGIN", type=float, default=0.2,
                         help="Margin for the entropy-based OOD loss.")
-    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.1, # 熵正则化系数，尝试0.01到0.1
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.01, # 熵正则化系数，尝试0.01到0.1
                         help="Weight for the entropy regularization term in OOD prompt training.")
-    parser.add_argument("--KL_COEFF", type=float, default=0.1, # KL散度损失系数，用于COOP训练
+    parser.add_argument("--KL_COEFF", type=float, default=0.4, # KL散度损失系数，用于COOP训练
                         help="Coefficient for KL divergence loss in COOP prompt training.")
 
     #  Conformal Prediction Thresholds
