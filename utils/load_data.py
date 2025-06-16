@@ -6,7 +6,7 @@ from sklearn.model_selection import train_test_split
 import torch
 from transformers import AutoTokenizer
 
-from utils.Dataloder import LLMCSVTrafficDataset, convert_feature_to_prompt_text
+from utils.Dataloader import LLMCSVTrafficDataset, convert_feature_to_prompt_text
 
 
 
