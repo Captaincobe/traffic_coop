@@ -78,11 +78,16 @@ model_save_path = f"./models/{dataset_name}/trained_{args.dataset_name}_{args.SA
 
 if __name__ == "__main__":
     if os.path.exists(model_save_path):
-        model_instance.load_state_dict(torch.load(model_save_path))
+        print(f"Loading trained model from {model_save_path}")
+        checkpoint = torch.load(model_save_path)
+        model_instance.load_state_dict(checkpoint['model_state_dict'])
         model_instance.to(DEVICE)
         model_instance.eval()
         original_model_base_global_indices_state = list(model_instance.base_class_global_indices)
         model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
+        # Load eci_thresholds as well:
+        model_instance.eci_thresholds = checkpoint['eci_thresholds'] 
+        print("Model and ECI thresholds loaded successfully.")
     else:
         non_conformity_scores_val = []
 
@@ -129,7 +134,10 @@ if __name__ == "__main__":
         print("LLMTrafficDECOOP Model Training Finished.")
 
         try:
-            torch.save(model_instance.state_dict(), model_save_path)
+            torch.save({
+                'model_state_dict': model_instance.state_dict(),
+                'eci_thresholds': model_instance.eci_thresholds
+            }, model_save_path)
         except Exception as e:
             print(f"Error saving model: {e}")
 

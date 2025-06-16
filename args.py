@@ -31,7 +31,7 @@ def parameter_parser():
     parser.add_argument('--samples_per_class', dest='SAMPLES_PER_CLASS', type=int, default=200,
                         help='Number of samples per base class for few-shot training.')
 
-    parser.add_argument('--LLM_MODEL_NAME', type=str, default="FacebookAI/roberta-base",
+    parser.add_argument('--LLM_MODEL_NAME', type=str, default="bert-base-uncased",
                         choices=["bert-base-uncased","FacebookAI/roberta-base"],
                         help='Name of the pre-trained LLM model to use.')
     parser.add_argument('--device', dest='DEVICE', type=str, default="cuda",
@@ -44,11 +44,11 @@ def parameter_parser():
     parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
-    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=1e-4)
+    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-5)
     parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-3,
                         help='Learning rate for the classification head.')
 
-    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=400,
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=500,
                         help='Number of epochs for Detector training.')
     parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=50,
                         help='Number of epochs for Subclassifier training.')

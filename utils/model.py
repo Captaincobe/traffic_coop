@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from torch.nn.functional import softmax, cross_entropy
 from transformers import AutoModel # Keep AutoTokenizer, AutoModelForMaskedLM for MLMZeroShotClassifier
-from utils.utils import kl_divergence_loss_from_logits
+from utils.utils import EarlyStopping, kl_divergence_loss_from_logits
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
@@ -370,11 +370,13 @@ class LLMTrafficDECOOP(nn.Module):
         print(f"[ECII] thresholds for detector {k}: {self.eci_thresholds_k}")
         self.eci_thresholds.append(self.eci_thresholds_k)
 
-    def fit(self, train_dataset, k):
+    def fit(self, train_dataset, val_dataset, k):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_RATE_PROMPT
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=16)
+        
         # Keep encoder frozen to save memory; only train prompt & classifier
         self.prompt_manager.train()
 
@@ -403,6 +405,10 @@ class LLMTrafficDECOOP(nn.Module):
                 verbose=True
             )
             print(f"[Info] Using ReduceLROnPlateau for OOD prompt {k}.")
+
+        early_stopping = EarlyStopping(patience=self.args.PLATEAU_PATIENCE, # 使用与 ReduceLROnPlateau 相同的patience
+                                min_delta=0.0001, # 可以根据需要调整
+                                verbose=True)
         scaler = GradScaler()
 
         for epoch in range(self.args.NUM_EPOCHS):
@@ -464,13 +470,64 @@ class LLMTrafficDECOOP(nn.Module):
                 scaler.step(optimizer) 
                 scaler.update()              
 
-                if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-                    scheduler.step() # CosineAnnealingLR是按步更新
+                # if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                #     scheduler.step() # CosineAnnealingLR是按步更新
                 total_loss += loss.item()
+                # 如果使用了CosineAnnealingLR，在这里步进调度器
+                if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                    # 注意：如果warmup_steps是基于总步数，这里需要调整
+                    # 或者将scheduler的step放到epoch外，让它根据epoch总数来调度
+                    # 为了早停，最好让调度器在epoch级别更新，如果它基于epoch的话
+                    pass # CosineAnnealingLR 已经在外面根据总步数设置了
 
             avg_loss = total_loss / len(dataloader)
             acc = total_correct / total_id if total_id > 0 else 0.0
-            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Loss_id: {loss_id:4.f} | Loss_margin: {loss_margin:4.f} | Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
+            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] | Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
+# Loss_id: {loss_id:4.f} | Loss_margin: {loss_margin:4.f} 
+
+
+            # --- Validation ---
+            self.eval() 
+            total_val_loss = 0
+            with torch.no_grad():
+                for val_batch_idx, val_batch in enumerate(val_dataloader):
+                    val_input_ids = val_batch["input_ids"].to(self.device)
+                    val_attention_mask = val_batch["attention_mask"].to(self.device)
+                    val_global_labels = val_batch["global_labels"].to(self.device)
+
+                    # 注意：验证集包含ID和OOD，但OOD detector只对ID样本进行分类
+                    # 这里我们仍然使用 forward_ood，并计算ID样本的损失
+                    val_logits = self.prompt_manager.forward_ood(k=k, input_ids=val_input_ids, attention_mask=val_attention_mask)
+
+                    val_base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
+                    val_is_id = torch.isin(val_global_labels, val_base_indices_tensor)
+
+                    if val_is_id.any():
+                        # 将全局标签映射到本地基类索引
+                        val_mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                        for g, b in self.global2base.items():
+                            val_mapping_tensor[g] = b
+                        val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
+                        val_loss_id = loss_fn(val_logits[val_is_id], val_y_base)
+                        total_val_loss += val_loss_id.item()
+                    # 对于OOD样本，OOD prompt的loss_id部分不适用，但它们会影响熵，这里只关注ID分类性能
+                    # 如果需要OOD相关的验证指标，需要单独计算（如OOD-AUROC）
+
+            avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
+            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Val Loss: {avg_val_loss:.4f}")
+
+            # --- 学习率调度器更新 (ReduceLROnPlateau) ---
+            if self.args.LR_SCHEDULER_TYPE == "plateau":
+                scheduler.step(avg_val_loss) # 根据验证损失调整学习率
+
+            # --- 早停判断 ---
+            if early_stopping(avg_val_loss, self): # 传入当前模型实例
+                print(f"Early stopping at epoch {epoch+1}!")
+                break # 中断训练循环
+
+        if early_stopping.early_stop and early_stopping.best_model_state:
+            self.load_state_dict(early_stopping.best_model_state)
+            print("Loaded best model state based on early stopping.")
 
         # ---- freeze the k‑th OOD prompt after finishing training ----
         for p in self.prompt_manager.ood_prompts[k].parameters():
@@ -692,38 +749,36 @@ class DECOOPInferenceEngine:
                 pred_types.append("NEW" if is_new_sample else "ID")
             
             # --- 批量处理 "NEW" 样本 ---
-            # if is_new_mask.any():
-            #     new_sample_indices = torch.where(is_new_mask)[0]
+            if is_new_mask.any():
+                new_sample_indices = torch.where(is_new_mask)[0]
                 
-            #     if raw_texts is None: 
-            #         print("Warning: raw_texts not available in batch for MLMZeroShotClassifier. Using empty strings.")
-            #         texts_for_mlm = [""] * len(new_sample_indices)
-            #     else:
-            #         texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
+                if raw_texts is None: 
+                    print("Warning: raw_texts not available in batch for MLMZeroShotClassifier. Using empty strings.")
+                    texts_for_mlm = [""] * len(new_sample_indices)
+                else:
+                    texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
                 
-            #     zs_probs_batch, _ = self.model.zs_mlm_classifier.predict(texts_for_mlm) # (Num_new_samples, C_all)
-            #     # 直接赋值，因为 zs_probs_batch 已经是 C_all 维度
-            #     prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device) 
+                zs_probs_batch, _ = self.model.zs_mlm_classifier.predict(texts_for_mlm) # (Num_new_samples, C_all)
+                # 直接赋值，因为 zs_probs_batch 已经是 C_all 维度
+                prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device) 
 
-            # # --- 批量处理 "ID" 样本 ---
-            # if (~is_new_mask).any():
-            id_sample_indices = torch.where(~is_new_mask)[0]
-            
-            logits_coop_all_k = self.model.prompt_manager.forward_coop_batch(
-                input_ids=input_ids[id_sample_indices],
-                attention_mask=attention_mask[id_sample_indices]
-            ) # (Num_id_samples, C_base, K)
+            # --- 批量处理 "ID" 样本 ---
+            if (~is_new_mask).any():
+                id_sample_indices = torch.where(~is_new_mask)[0]
+                
+                logits_coop_all_k = self.model.prompt_manager.forward_coop_batch(
+                    input_ids=input_ids[id_sample_indices],
+                    attention_mask=attention_mask[id_sample_indices]
+                ) # (Num_id_samples, C_base, K)
 
-            best_k_for_id_samples = best_k_indices[id_sample_indices]
-            
-            best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
-            
-            selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2) # (Num_id_samples, C_base)
-            
+                best_k_for_id_samples = best_k_indices[id_sample_indices]
+                
+                best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
+                
+                selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2) # (Num_id_samples, C_base)
+                
+
             probs_id_batch = softmax(selected_coop_logits, dim=1) # (Num_id_samples, C_base)
-
-            # 修正：将 C_base 维度的概率映射到 C_all 维度的 prob_vectors 中
-            # 需要确保 self.model.base_global_set 在这里是可用的全局索引列表/张量
             global_indices_of_base_classes = torch.tensor(
                 sorted(list(self.model.base_global_set)), # 获取模型最终设置的全局基类索引
                 dtype=torch.long, device=self.model.device
