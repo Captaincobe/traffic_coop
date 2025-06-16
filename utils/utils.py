@@ -68,3 +68,44 @@ def debug_model_training(train_dataset, model_instance, base_class_indices_num_s
         print(f" - 样本预测分布:\n{probs.cpu().numpy()}")
 
     print("\n========== [DEBUG MODE ENDED] ==========")
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0001, verbose=False):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+        self.best_model_state = None
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.min_delta: # 如果分数没有显著提升
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else: # 如果分数有显著提升
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+        return self.early_stop
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decrease.'''
+        if val_loss < self.val_loss_min:
+            if self.verbose:
+                print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...')
+            # 保存整个模型的state_dict，或者只保存需要训练的prompt和classifier
+            # 考虑到LLMTrafficDECOOP的结构，保存其state_dict可能最简单
+            self.best_model_state = model.state_dict()
+            self.val_loss_min = val_loss
+            
