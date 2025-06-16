@@ -103,8 +103,13 @@ class SharedEncoderClassifier(nn.Module):
     def __init__(self, shared_encoder, hidden_dim, num_classes):
         super().__init__()
         self.encoder = shared_encoder
-        self.classifier = nn.Linear(hidden_dim, num_classes) # , dtype=torch.float16
-
+        # self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),                               
+            nn.Dropout(0.5),                      
+            nn.Linear(hidden_dim // 2, num_classes) 
+        )
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, cls_token=None):
         if cls_token is not None:
             return self.classifier(cls_token)
@@ -148,9 +153,10 @@ class PromptLearnerManager(nn.Module):
         ])
         # self.classifier = nn.Linear(self.embedding_dim, num_labels).to(torch.float32)
         self.classifier = nn.Sequential(
+            nn.Dropout(0.5),                      
             nn.Linear(self.embedding_dim, self.embedding_dim // 2),
             nn.ReLU(),                               
-            nn.Dropout(0.2),                      
+            nn.Dropout(0.5),                      
             nn.Linear(self.embedding_dim // 2, num_labels) 
         )
     def _forward_with_prompt(self, prompt_module, input_ids, attention_mask):
@@ -382,6 +388,7 @@ class LLMTrafficDECOOP(nn.Module):
 
         optimizer = torch.optim.AdamW(
             self.prompt_manager.get_ood_parameters_k(k),
+            weight_decay=self.args.WEIGHT_DECAY,
             lr=learning_rate
         )
         loss_fn = nn.CrossEntropyLoss()
@@ -410,7 +417,10 @@ class LLMTrafficDECOOP(nn.Module):
                                 min_delta=0.0001, # 可以根据需要调整
                                 verbose=True)
         scaler = GradScaler()
-
+        from collections import Counter
+        val_global_labels_all = [s['global_labels'].item() for s in val_dataset]
+        print(f"\nUnique Global Labels in Val Dataset: {sorted(list(set(val_global_labels_all)))}")
+        print(f"Global Label Counts in Val Dataset: {Counter(val_global_labels_all)}")
         for epoch in range(self.args.NUM_EPOCHS):
             total_loss = 0
             total_correct = 0
@@ -470,60 +480,60 @@ class LLMTrafficDECOOP(nn.Module):
                 scaler.step(optimizer) 
                 scaler.update()              
 
-                # if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-                #     scheduler.step() # CosineAnnealingLR是按步更新
+                if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                    scheduler.step() # CosineAnnealingLR是按步更新
                 total_loss += loss.item()
                 # 如果使用了CosineAnnealingLR，在这里步进调度器
-                if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-                    # 注意：如果warmup_steps是基于总步数，这里需要调整
-                    # 或者将scheduler的step放到epoch外，让它根据epoch总数来调度
-                    # 为了早停，最好让调度器在epoch级别更新，如果它基于epoch的话
-                    pass # CosineAnnealingLR 已经在外面根据总步数设置了
+                # if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                #     # 注意：如果warmup_steps是基于总步数，这里需要调整
+                #     # 或者将scheduler的step放到epoch外，让它根据epoch总数来调度
+                #     # 为了早停，最好让调度器在epoch级别更新，如果它基于epoch的话
+                #     pass # CosineAnnealingLR 已经在外面根据总步数设置了
 
             avg_loss = total_loss / len(dataloader)
             acc = total_correct / total_id if total_id > 0 else 0.0
             print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] | Loss: {avg_loss:.4f} | ID Acc: {acc:.4f}")
 # Loss_id: {loss_id:4.f} | Loss_margin: {loss_margin:4.f} 
 
+            if epoch >= 60 and (epoch - 60) % 2 == 0: #
+                self.eval()
+                total_val_loss = 0
+                with torch.no_grad():
+                    for val_batch_idx, val_batch in enumerate(val_dataloader):
+                        val_input_ids = val_batch["input_ids"].to(self.device)
+                        val_attention_mask = val_batch["attention_mask"].to(self.device)
+                        val_global_labels = val_batch["global_labels"].to(self.device)
 
-            # --- Validation ---
-            self.eval() 
-            total_val_loss = 0
-            with torch.no_grad():
-                for val_batch_idx, val_batch in enumerate(val_dataloader):
-                    val_input_ids = val_batch["input_ids"].to(self.device)
-                    val_attention_mask = val_batch["attention_mask"].to(self.device)
-                    val_global_labels = val_batch["global_labels"].to(self.device)
+                        # 注意：验证集包含ID和OOD，但OOD detector只对ID样本进行分类
+                        # 这里我们仍然使用 forward_ood，并计算ID样本的损失
+                        val_logits = self.prompt_manager.forward_ood(k=k, input_ids=val_input_ids, attention_mask=val_attention_mask)
 
-                    # 注意：验证集包含ID和OOD，但OOD detector只对ID样本进行分类
-                    # 这里我们仍然使用 forward_ood，并计算ID样本的损失
-                    val_logits = self.prompt_manager.forward_ood(k=k, input_ids=val_input_ids, attention_mask=val_attention_mask)
+                        val_base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
+                        val_is_id = torch.isin(val_global_labels, val_base_indices_tensor)
 
-                    val_base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
-                    val_is_id = torch.isin(val_global_labels, val_base_indices_tensor)
+                        if val_is_id.any():
+                            # 将全局标签映射到本地基类索引
+                            val_mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                            for g, b in self.global2base.items():
+                                val_mapping_tensor[g] = b
+                            val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
+                            val_loss_id = loss_fn(val_logits[val_is_id], val_y_base)
+                            total_val_loss += val_loss_id.item()
+                    # For OOD samples, the OOD prompt's loss_id part does not apply,
+                    # but they would affect entropy. Here, we only focus on ID classification performance.
+                    # If OOD-related validation metrics are needed, they should be calculated separately (e.g., OOD-AUROC).
 
-                    if val_is_id.any():
-                        # 将全局标签映射到本地基类索引
-                        val_mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
-                        for g, b in self.global2base.items():
-                            val_mapping_tensor[g] = b
-                        val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
-                        val_loss_id = loss_fn(val_logits[val_is_id], val_y_base)
-                        total_val_loss += val_loss_id.item()
-                    # 对于OOD样本，OOD prompt的loss_id部分不适用，但它们会影响熵，这里只关注ID分类性能
-                    # 如果需要OOD相关的验证指标，需要单独计算（如OOD-AUROC）
+                    avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
+                    print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Val Loss: {avg_val_loss:.4f}")
 
-            avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
-            print(f"[PromptTuning][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Val Loss: {avg_val_loss:.4f}")
+                # --- 学习率调度器更新 (ReduceLROnPlateau) ---
+                if self.args.LR_SCHEDULER_TYPE == "plateau":
+                    scheduler.step(avg_val_loss) # 根据验证损失调整学习率
 
-            # --- 学习率调度器更新 (ReduceLROnPlateau) ---
-            if self.args.LR_SCHEDULER_TYPE == "plateau":
-                scheduler.step(avg_val_loss) # 根据验证损失调整学习率
-
-            # --- 早停判断 ---
-            if early_stopping(avg_val_loss, self): # 传入当前模型实例
-                print(f"Early stopping at epoch {epoch+1}!")
-                break # 中断训练循环
+                # --- 早停判断 ---
+                if early_stopping(avg_val_loss, self): # 传入当前模型实例
+                    print(f"Early stopping at epoch {epoch+1}!")
+                    break # 中断训练循环
 
         if early_stopping.early_stop and early_stopping.best_model_state:
             self.load_state_dict(early_stopping.best_model_state)
@@ -534,11 +544,13 @@ class LLMTrafficDECOOP(nn.Module):
             p.requires_grad = False
 
     
-    def fit_sub_classifiers(self, train_dataset):
+    def fit_sub_classifiers(self, train_dataset, val_dataset):
         batch_size = self.args.BATCH_SIZE
         learning_rate = self.args.LEARNING_SUBFIT
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=16) # 使用 self.val_dataset
+
         scaler = GradScaler()
 
 
@@ -549,20 +561,23 @@ class LLMTrafficDECOOP(nn.Module):
                 # 训练COOP Prompt Manager的参数，Sub-classifier的参数，以及共享编码器的LoRA适配器
                 list(self.prompt_manager.get_coop_parameters_k(k)) +
                 list(self.sub_classifiers_[k].parameters()),
+                weight_decay=self.args.WEIGHT_DECAY,
                 lr=learning_rate
             )
             # === 学习率调度器设置 (针对 fit_sub_classifiers 方法) ===
-            num_training_steps = len(dataloader) * self.args.N_EPOCHS_SUBCLASSIFIER
+            # num_training_steps = len(dataloader) * self.args.N_EPOCHS_SUBCLASSIFIER # 早停会覆盖这个
 
             if self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-                warmup_steps = int(num_training_steps * self.args.WARMUP_EPOCHS / self.args.N_EPOCHS_SUBCLASSIFIER)
-                def lr_lambda(current_step: int):
-                    if current_step < warmup_steps:
-                        return float(current_step) / float(max(1, warmup_steps))
-                    progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+                warmup_steps = int(self.args.N_EPOCHS_SUBCLASSIFIER * self.args.WARMUP_EPOCHS)
+                num_training_epochs = self.args.N_EPOCHS_SUBCLASSIFIER
+                def lr_lambda(current_epoch: int):
+                    if current_epoch < warmup_steps:
+                        return float(current_epoch) / float(max(1, warmup_steps))
+                    progress = float(current_epoch - warmup_steps) / float(max(1, num_training_epochs - warmup_steps))
                     return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
                 scheduler = LambdaLR(optimizer, lr_lambda)
+                print(f"[Info] Using CosineAnnealingLR with warmup for COOP prompt {k}.")
             elif self.args.LR_SCHEDULER_TYPE == "plateau":
                 scheduler = ReduceLROnPlateau(
                     optimizer,
@@ -576,18 +591,22 @@ class LLMTrafficDECOOP(nn.Module):
                 scheduler = None
                 print("[Info] No LR scheduler applied for COOP prompt training.")
 
+            # 初始化早停
+            early_stopping = EarlyStopping(patience=self.args.PLATEAU_PATIENCE,
+                                         min_delta=0.0001,
+                                         verbose=True)
+
             for epoch in range(self.args.N_EPOCHS_SUBCLASSIFIER):
-                total_loss = 0
+                # --- 训练阶段 ---
                 self.train()
+                total_loss = 0
                 for batch in dataloader:
                     input_ids = batch["input_ids"].to(self.device)
                     attention_mask = batch["attention_mask"].to(self.device)
                     labels = batch["labels"].to(self.device)
 
                     optimizer.zero_grad()
-                    # OOD detector to mask ID/OOD using prompt_manager.forward_ood
                     with torch.no_grad():
-
                         logits_ood = self.prompt_manager.forward_ood(k=k, input_ids=input_ids, attention_mask=attention_mask)
                         probs_ood  = softmax(logits_ood, dim=1)
                         entropy    = -torch.sum(probs_ood * torch.log(probs_ood + 1e-8), dim=1)
@@ -595,15 +614,10 @@ class LLMTrafficDECOOP(nn.Module):
                         base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
                         id_by_entropy = entropy <= self.args.CP_OOD_THRESHOLD
                         id_by_label   = torch.isin(labels, base_indices_tensor)
-                        is_id = id_by_entropy & id_by_label            # 同时满足才算 ID
+                        is_id = id_by_entropy & id_by_label
+                    
                     with autocast():
                         logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=input_ids, attention_mask=attention_mask)
-
-                        # Compute logits_zs for KL loss, zs_classifier remains frozen but allow gradient for input
-                        with torch.no_grad():
-                            outputs_zs = self.shared_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                            cls_token_zs = outputs_zs.last_hidden_state[:, 0]
-                            logits_zs = self.zs_classifier_.classifier(cls_token_zs)
 
                         loss = 0.0
                         if is_id.any():
@@ -614,17 +628,15 @@ class LLMTrafficDECOOP(nn.Module):
                             loss_id = cross_entropy(logits_sub[is_id], y_base)
                             loss += loss_id
                         if (~is_id).any():
+                            with torch.no_grad():
+                                outputs_zs = self.shared_encoder(input_ids=input_ids, attention_mask=attention_mask)
+                                cls_token_zs = outputs_zs.last_hidden_state[:, 0]
+                                logits_zs = self.zs_classifier_.classifier(cls_token_zs)
                             loss_kl = kl_divergence_loss_from_logits(logits_sub[~is_id], logits_zs[~is_id])
                             loss += self.args.KL_COEFF * loss_kl
 
-                    # optimizer.zero_grad()
-                    # loss.backward()
-                    # torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                    # optimizer.step()
-
                     scaler.scale(loss).backward()
-                    # 梯度裁剪
-                    scaler.unscale_(optimizer) # 在裁剪前unscale
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         list(self.prompt_manager.get_coop_parameters_k(k)) +
                         list(self.sub_classifiers_[k].parameters()),
@@ -634,12 +646,73 @@ class LLMTrafficDECOOP(nn.Module):
                     scaler.step(optimizer)
                     scaler.update()
 
-                    if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
-                        scheduler.step() # CosineAnnealingLR是按步更新
                     total_loss += loss.item()
-                print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Total Loss: {total_loss/len(dataloader):.4f}")
-                if scheduler and self.args.LR_SCHEDULER_TYPE == "plateau":
-                    scheduler.step(total_loss/len(dataloader)) # ReduceLROnPlateau是按epoch更新，传入监控指标
+
+                avg_train_loss = total_loss / len(dataloader)
+                print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Train Loss: {avg_train_loss:.4f}")
+
+                if epoch >= 20 and (epoch - 20) % 2 == 0: #
+                    # --- 验证阶段 ---
+                    self.eval() # 切换到评估模式
+                    total_val_loss = 0
+                    with torch.no_grad():
+                        for val_batch in val_dataloader:
+                            val_input_ids = val_batch["input_ids"].to(self.device)
+                            val_attention_mask = val_batch["attention_mask"].to(self.device)
+                            val_global_labels = val_batch["global_labels"].to(self.device)
+
+                            # OOD detector to mask ID/OOD using prompt_manager.forward_ood
+                            val_logits_ood = self.prompt_manager.forward_ood(k=k, input_ids=val_input_ids, attention_mask=val_attention_mask)
+                            val_probs_ood  = softmax(val_logits_ood, dim=1)
+                            val_entropy    = -torch.sum(val_probs_ood * torch.log(val_probs_ood + 1e-8), dim=1)
+
+                            val_base_indices_tensor = torch.tensor(self.base_class_global_indices, device=self.device)
+                            val_id_by_entropy = val_entropy <= self.args.CP_OOD_THRESHOLD
+                            val_id_by_label   = torch.isin(val_global_labels, val_base_indices_tensor)
+                            val_is_id = val_id_by_entropy & val_id_by_label
+
+                            val_logits_sub = self.prompt_manager.forward_coop(k=k, input_ids=val_input_ids, attention_mask=val_attention_mask)
+
+                            val_outputs_zs = self.shared_encoder(input_ids=val_input_ids, attention_mask=val_attention_mask)
+                            val_cls_token_zs = val_outputs_zs.last_hidden_state[:, 0]
+                            val_logits_zs = self.zs_classifier_.classifier(val_cls_token_zs)
+
+                            val_batch_loss = 0.0
+                            if val_is_id.any():
+                                val_mapping_tensor = torch.full((self.num_all_classes,), -1, device=self.device, dtype=torch.long)
+                                for g, b in self.global2base.items():
+                                    val_mapping_tensor[g] = b
+                                val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
+                                val_loss_id = cross_entropy(val_logits_sub[val_is_id], val_y_base)
+                                val_batch_loss += val_loss_id
+                            if (~val_is_id).any():
+                                val_loss_kl = kl_divergence_loss_from_logits(val_logits_sub[~val_is_id], val_logits_zs[~val_is_id])
+                                val_batch_loss += self.args.KL_COEFF * val_loss_kl
+                            
+                            total_val_loss += val_batch_loss.item()
+                
+                    avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
+                    print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Val Loss: {avg_val_loss:.4f}")
+
+
+                    # --- 学习率调度器更新 ---
+                    if scheduler and self.args.LR_SCHEDULER_TYPE == "cosine_with_warmup":
+                        scheduler.step()
+                    elif scheduler and self.args.LR_SCHEDULER_TYPE == "plateau":
+                        scheduler.step(avg_val_loss)
+
+                    # --- 早停判断 ---
+                    if early_stopping(avg_val_loss, self):
+                        print(f"Early stopping at epoch {epoch+1} for Sub-classifier {k}!")
+                        break # 中断训练循环
+
+            # 如果早停发生，加载最佳模型状态
+            if early_stopping.early_stop and early_stopping.best_model_state:
+                self.load_state_dict(early_stopping.best_model_state)
+                print(f"Loaded best model state for Sub-classifier {k} based on early stopping.")
+            else:
+                 print(f"Training of Sub-classifier {k} finished without early stopping.")
+
 
             # ---- freeze the k‑th COOP prompt after training ----
             for p in self.prompt_manager.coop_prompts[k].parameters():

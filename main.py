@@ -120,7 +120,7 @@ if __name__ == "__main__":
             # The `fit` method will use the temporarily set `model_instance.base_global_set`
             # to distinguish ID samples from the pseudo-OOD samples (the left-out class).
             print(f"\n[Training PromptLearner OOD #{k}] with {len(train_dataset)} samples (ID and pseudo-OOD determined internally).")
-            model_instance.fit(train_dataset, k=k)
+            model_instance.fit(train_dataset, val_dataset, k=k)
             
             # Similarly, pass the full val_dataset for calibration.
             # `eci_calibration` will also use the temporarily set `model_instance.base_global_set`
@@ -130,7 +130,7 @@ if __name__ == "__main__":
         model_instance.set_base_class_global_indices(original_model_base_global_indices_state)
         print(f"\nRestored model's base class configuration to: {model_instance.base_class_global_indices}")
 
-        model_instance.fit_sub_classifiers(train_dataset)
+        model_instance.fit_sub_classifiers(train_dataset,val_dataset)
         print("LLMTrafficDECOOP Model Training Finished.")
 
         try:

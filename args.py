@@ -44,7 +44,7 @@ def parameter_parser():
     parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
                     help='Batch size for training (LLMs often require smaller batch sizes).')
     
-    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-5)
+    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-4)
     parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-3,
                         help='Learning rate for the classification head.')
 
@@ -68,7 +68,7 @@ def parameter_parser():
     parser.add_argument('--ALPHA_CP', type=float, default=0.1,
                         help='Alpha parameter for confidence penalty.')
 
-
+    parser.add_argument('--WEIGHT_DECAY', type=float, default=5e-4, help='Weight decay (L2 loss on parameters).')
     parser.add_argument('--WARMUP_EPOCHS', type=float, default=0.1,
                         help="Fraction of total epochs for linear warmup (e.g., 0.1 for 10% of epochs).")
     parser.add_argument("--LR_SCHEDULER_TYPE", type=str, default="cosine_with_warmup",
@@ -77,7 +77,7 @@ def parameter_parser():
     # Plateau 调度器参数
     parser.add_argument("--PLATEAU_FACTOR", type=float, default=0.1,
                         help="Factor by which the learning rate will be reduced. new_lr = lr * factor.")
-    parser.add_argument("--PLATEAU_PATIENCE", type=int, default=5,
+    parser.add_argument("--PLATEAU_PATIENCE", type=int, default=7,
                         help="Number of epochs with no improvement after which learning rate will be reduced (if LR_SCHEDULER_TYPE is 'plateau').")
 
 
@@ -85,5 +85,3 @@ def parameter_parser():
 
     return args
 
-    # parser.add_argument('--weight_decay', dest='WEIGHT_DECAY', type=float, default=5e-4,
-    #             help='Weight decay (L2 loss on parameters).')
