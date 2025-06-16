@@ -1,0 +1,73 @@
+import argparse
+
+
+def parameter_parser():
+    parser = argparse.ArgumentParser(description="Configuration and Hyperparameters for Model Training")
+    parser.add_argument('--num_base_classes', dest='NUM_BASE_CLASSES', type=int, default=-1)
+    parser.add_argument('--num_all_classes', dest='NUM_ALL_CLASSES', type=int, default=-1)
+    # Removed LLM-specific LABEL_TOKEN_MAP, as it's not used by MLP-based models.
+    # parser.add_argument('--label_map', dest='LABEL_TOKEN_MAP', default={...})
+
+    parser.add_argument('--dataset_name', type=str, default='ISCXVPN2016',
+                        choices=["ISCXVPN2016", "ISCXTor2016", "USTC-TFC2016", "CIC-Darknet2020"])
+    # Few-shot training parameter
+    parser.add_argument('--samples_per_class', dest='SAMPLES_PER_CLASS', type=int, default=200,
+                        help='Number of samples per base class for few-shot training.')
+
+    # Added MLP-specific parameters for defining network architecture.
+    parser.add_argument('--input_dim', dest='INPUT_DIM', type=int, default=-1,
+                        help='Dimension of input features for MLP. This will be set dynamically by load_data.py.')
+    parser.add_argument('--mlp_hidden_dims_zs', dest='MLP_HIDDEN_DIMS_ZS', type=int, nargs='+', default=[128, 64],
+                        help='Hidden layer dimensions for the Zero-Shot MLP classifier (e.g., --mlp_hidden_dims_zs 128 64).')
+    parser.add_argument('--mlp_hidden_dims_ood', dest='MLP_HIDDEN_DIMS_OOD', type=int, nargs='+', default=[128, 64],
+                        help='Hidden layer dimensions for the OOD MLP detectors.')
+    parser.add_argument('--mlp_hidden_dims_coop', dest='MLP_HIDDEN_DIMS_COOP', type=int, nargs='+', default=[128, 64],
+                        help='Hidden layer dimensions for the COOP MLP classifiers.')
+
+    parser.add_argument('--device', dest='DEVICE', type=str, default="cuda",
+                    help='Device to use for training (e.g., "cuda" or "cpu").')
+    parser.add_argument('--k', dest='K_DETECTORS', type=int, default=3,
+                        help='Number of detectors per DECOOP paper (often K=3).')
+    parser.add_argument('--batch_size', dest='BATCH_SIZE', type=int, default=256,
+                    help='Batch size for training.')
+    
+    parser.add_argument('--lr_subfit', dest='LEARNING_SUBFIT', type=float, default=5e-4)
+    parser.add_argument('--lr_prompt', dest='LEARNING_RATE_PROMPT', type=float, default=5e-3,
+                        help='Learning rate for OOD detector training.')
+
+    parser.add_argument('--n_epo', dest='NUM_EPOCHS', type=int, default=500,
+                        help='Number of epochs for Detector training.')
+    parser.add_argument('--n_eposub', dest='N_EPOCHS_SUBCLASSIFIER', type=int, default=50,
+                        help='Number of epochs for Subclassifier training.')
+
+
+    # OOD/ID Loss Regularization
+    parser.add_argument("--OOD_MARGIN", type=float, default=0.2,
+                        help="Margin for the entropy-based OOD loss.")
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.05,
+                        help="Weight for the entropy regularization term in OOD prompt training.")
+    parser.add_argument("--KL_COEFF", type=float, default=0.4,
+                        help="Coefficient for KL divergence loss in COOP training.")
+
+    # Conformal Prediction Thresholds
+    parser.add_argument("--CP_OOD_THRESHOLD", type=float, default=0.9,
+                    help="Conformal prediction OOD threshold. Will be calibrated during ECI.")
+    parser.add_argument('--ALPHA_CP', type=float, default=0.1,
+                        help='Alpha parameter for confidence penalty.')
+
+    parser.add_argument('--WEIGHT_DECAY', type=float, default=5e-4, help='Weight decay (L2 loss on parameters).')
+    parser.add_argument('--WARMUP_EPOCHS', type=float, default=0.1,
+                        help="Fraction of total epochs for linear warmup (e.g., 0.1 for 10% of epochs).")
+    parser.add_argument("--LR_SCHEDULER_TYPE", type=str, default="cosine_with_warmup",
+                    choices=["cosine_with_warmup", "plateau", "none"],
+                    help="Type of LR scheduler to use.")
+    # Plateau scheduler parameters
+    parser.add_argument("--PLATEAU_FACTOR", type=float, default=0.1,
+                        help="Factor by which the learning rate will be reduced.")
+    parser.add_argument("--PLATEAU_PATIENCE", type=int, default=7,
+                        help="Number of epochs with no improvement after which learning rate will be reduced.")
+
+
+    args = parser.parse_args()
+
+    return args
