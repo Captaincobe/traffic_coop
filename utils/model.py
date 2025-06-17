@@ -767,14 +767,14 @@ class LLMTrafficDECOOP(nn.Module):
                                 val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
                                 val_loss_id = cross_entropy(val_logits_coop[val_is_id], val_y_base)
                                 val_batch_loss += val_loss_id
-                            if (~val_is_id).any():
-                                val_zs_probs_ood_samples, _ = self.zs_mlm_classifier.predict([val_raw_texts[i] for i in torch.where(~val_is_id)[0]])
-                                val_zs_probs_ood_samples = val_zs_probs_ood_samples.to(self.device)
-                                val_zs_logits_ood_samples = torch.log(val_zs_probs_ood_samples + 1e-8)
-                                val_zs_logits_for_kl_distillation = val_zs_logits_ood_samples[:, self.base_class_global_indices]
+                            # if (~val_is_id).any():
+                            #     val_zs_probs_ood_samples, _ = self.zs_mlm_classifier.predict([val_raw_texts[i] for i in torch.where(~val_is_id)[0]])
+                            #     val_zs_probs_ood_samples = val_zs_probs_ood_samples.to(self.device)
+                            #     val_zs_logits_ood_samples = torch.log(val_zs_probs_ood_samples + 1e-8)
+                            #     val_zs_logits_for_kl_distillation = val_zs_logits_ood_samples[:, self.base_class_global_indices]
 
-                                val_loss_kl = kl_divergence_loss_from_logits(val_logits_coop[~val_is_id], val_zs_logits_for_kl_distillation)
-                                val_batch_loss += self.args.KL_COEFF * val_loss_kl
+                            #     val_loss_kl = kl_divergence_loss_from_logits(val_logits_coop[~val_is_id], val_zs_logits_for_kl_distillation)
+                            #     val_batch_loss += self.args.KL_COEFF * val_loss_kl
 
                             total_val_loss += val_batch_loss.item()
 

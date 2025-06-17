@@ -6,10 +6,12 @@ from sklearn.model_selection import train_test_split
 import torch
 from transformers import AutoTokenizer
 
+from datasetsM.preprocess import Z_Scaler
 from utils.Dataloader import LLMCSVTrafficDataset, convert_feature_to_prompt_text
+from utils_mlp.load_data import _get_features_to_standardize_for_loading
 
 # Import Z_Scaler and _get_features_to_standardize_for_loading from datasets/preprocess.py
-from datasets.preprocess import Z_Scaler, _get_features_to_standardize_for_loading as get_numerical_features_config
+# from datasets.preprocess import Z_Scaler, _get_features_to_standardize_for_loading as get_numerical_features_config
 
 
 # --- 1. Data Loading and Preprocessing (Using implementations from previous responses) ---
@@ -52,7 +54,7 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         df = pd.read_csv(csv_path)
         
         # Get list of numerical features for MLP input
-        numerical_feature_cols = get_numerical_features_config(dataset_name)
+        numerical_feature_cols = _get_features_to_standardize_for_loading(dataset_name)
         # Set the input dimension for the numerical feature extractor in args
         args.INPUT_DIM = len(numerical_feature_cols)
 

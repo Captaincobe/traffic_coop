@@ -10,7 +10,106 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 
 # Import MLMZeroShotClassifier from the LLM utils model
-from utils.model import MLMZeroShotClassifier # 新增导入
+# from utils.model import MLMZeroShotClassifier # 新增导入
+class MLMZeroShotClassifier:
+    def __init__(self, model_name, label_token_map, template="This traffic is [MASK].", device="cuda"):
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
+        self.template = template
+        self.label_token_map = label_token_map
+
+        # ------------------------------------------------------------------
+        # Convert label ➜ token‑id  ——  Scheme B: automatically add new
+        # whole‑word tokens to the tokenizer when the default BPE split
+        # would produce multiple sub‑tokens.  This keeps every verbalizer
+        # one‑to‑one with a single token so that masked‑LM logits are
+        # comparable across labels.
+        # ------------------------------------------------------------------
+        self.label_token_ids = {}
+
+        # 1) Gather all words that need to be appended to the vocab
+        tokens_to_add = []
+        for word in label_token_map.values():
+            if len(self.tokenizer.tokenize(word)) != 1:
+                tokens_to_add.append(word)
+
+        # 2) Add them *once* and resize the model’s embedding matrix
+        if tokens_to_add:
+            n_added = self.tokenizer.add_tokens(tokens_to_add, special_tokens=False)
+            if n_added > 0:
+                self.model.resize_token_embeddings(len(self.tokenizer))
+                print(f"[Info] Added {n_added} new tokenizer tokens for MLM labels: {tokens_to_add}")
+
+        # 3) Build the final label→token‑id mapping (now guaranteed 1‑to‑1)
+        for label, word in label_token_map.items():
+            tokens = self.tokenizer.tokenize(word)
+            if len(tokens) != 1:
+                # Defensive fallback; should not happen after the addition step
+                print(f"[Warning] Label '{label}' still maps to multiple tokens: {tokens}")
+                continue
+            token_id = self.tokenizer.convert_tokens_to_ids(tokens[0])
+            self.label_token_ids[label] = token_id
+
+    def eval(self):
+        """
+        Make the wrapped masked‑LM enter evaluation mode and
+        return self so the call can be chained just like with
+        nn.Module.eval().
+        """
+        self.model.eval()
+        return self
+
+
+
+    def predict(self, input_texts):
+        """
+        Parameters
+        ----------
+        input_texts : Union[str, List[str]]
+            Raw flow‑text descriptions. A single string will be automatically converted
+            to a one‑element list.
+
+        Returns
+        -------
+        probs : torch.Tensor, shape = (B, C)
+            Soft‑max probabilities over C labels for each sample in the batch.
+        label_names : List[str]
+            The label order corresponding to the second dimension of probs.
+        """
+        if isinstance(input_texts, str):
+            input_texts = [input_texts]
+
+        # Assemble the prompt: "<flow text> This traffic is [MASK]."
+        prompts = [
+            f"{t} This traffic is {self.tokenizer.mask_token}."
+            for t in input_texts
+        ]
+
+        batch = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(self.device)
+
+        # Locate the [MASK] position for every sample
+        mask_positions = (batch.input_ids == self.tokenizer.mask_token_id).nonzero(as_tuple=True)
+
+        with torch.no_grad(): # MLMZeroShotClassifier 保持冻结，仅用于推理
+            logits = self.model(**batch).logits        # (B, L, V)
+
+        # Select logits corresponding to the [MASK] token
+        mask_logits = logits[mask_positions]          # (B, V)
+
+        # Keep only the logits of label verbalizer tokens
+        label_token_ids = list(self.label_token_ids.values())
+        scores = mask_logits[:, label_token_ids]      # (B, C)
+
+        probs = torch.softmax(scores, dim=-1)         # (B, C)
+
+        return probs.cpu(), list(self.label_token_ids.keys())
 
 # --- Helper for KL Div ---
 def kl_divergence_loss_from_logits(pred_logits, target_logits_detached):
@@ -88,14 +187,13 @@ class LLMTrafficDECOOP(nn.Module):
         self.num_base_classes = args.NUM_BASE_CLASSES
         self.num_all_classes = args.NUM_ALL_CLASSES
 
-        # --- Classifiers ---
-        # 零样本分类器现在使用 MLMZeroShotClassifier
-        self.zs_classifier_ = MLMZeroShotClassifier( # 替换为 MLMZeroShotClassifier
-            model_name=args.LLM_MODEL_NAME, # 需要从 args 中获取 LLM 模型名称
-            label_token_map=args.LABEL_TOKEN_MAP, # 需要从 args 中获取标签 token 映射
+        # --- Zero‑shot classifier (MLM) ---
+        self.zs_classifier_ = MLMZeroShotClassifier(
+            model_name=args.LLM_MODEL_NAME,          # e.g. "bert-base-uncased"
+            label_token_map=args.LABEL_TOKEN_MAP,    # map global label → verbalizer
             device=self.device
         )
-        # MLMZeroShotClassifier 内部已经冻结了其模型参数，不需要手动设置 requires_grad = False
+        self.zs_classifier_.eval()  # frozen; inference only
 
         self.ood_classifiers = nn.ModuleList([
             MLPClassifier(
@@ -396,7 +494,7 @@ class LLMTrafficDECOOP(nn.Module):
 
             for ood_det in self.ood_classifiers:
                 ood_det.eval()
-            # self.zs_classifier_.eval() # MLMZeroShotClassifier 不会有 train/eval 模式
+            self.zs_classifier_.eval()
 
 
             for epoch in range(self.args.N_EPOCHS_SUBCLASSIFIER):
@@ -404,9 +502,8 @@ class LLMTrafficDECOOP(nn.Module):
                 self.coop_classifiers[k].train()
                 total_loss = 0
                 for batch in dataloader:
-                    features = batch["features"].to(self.device)
+                    features = batch["features"].to(self.device) # Fused features
                     global_labels = batch["global_labels"].to(self.device)
-                    raw_texts = batch["raw_text"] # 获取原始文本
 
                     optimizer.zero_grad()
 
@@ -436,11 +533,8 @@ class LLMTrafficDECOOP(nn.Module):
 
                         if is_ood.any():
                             with torch.no_grad():
-                                # 使用 MLMZeroShotClassifier 进行零样本预测，并转换为 logits
-                                zs_probs_ood_samples, _ = self.zs_classifier_.predict([raw_texts[i] for i in torch.where(is_ood)[0]])
-                                # 为了 KL Div，需要将 probs 转换为 logits (log_softmax 的逆操作)
-                                zs_probs_ood_samples = zs_probs_ood_samples.to(self.device)
-                                zs_logits_ood_samples = torch.log(zs_probs_ood_samples + 1e-8) # 转换为 log-space logits
+                                # Now, zs_classifier_ is an MLP, it takes features directly
+                                zs_logits_ood_samples = self.zs_classifier_(features[is_ood])
                                 zs_logits_for_kl_distillation = zs_logits_ood_samples[:, self.base_class_global_indices]
 
                             loss_kl = kl_divergence_loss_from_logits(
@@ -452,7 +546,7 @@ class LLMTrafficDECOOP(nn.Module):
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        self.coop_classifiers[k].parameters(), # 只有 coop_classifiers 的参数需要裁剪
+                        self.coop_classifiers[k].parameters(),
                         max_norm=1.0
                     )
 
@@ -470,9 +564,8 @@ class LLMTrafficDECOOP(nn.Module):
                     total_val_loss = 0
                     with torch.no_grad():
                         for val_batch in val_dataloader:
-                            val_features = val_batch["features"].to(self.device)
+                            val_features = val_batch["features"].to(self.device) # Fused features
                             val_global_labels = val_batch["global_labels"].to(self.device)
-                            val_raw_texts = val_batch["raw_text"] # 获取原始文本
 
                             val_logits_ood = self.ood_classifiers[k](val_features)
                             val_probs_ood  = softmax(val_logits_ood, dim=1)
@@ -492,10 +585,8 @@ class LLMTrafficDECOOP(nn.Module):
                                 val_loss_id = cross_entropy(val_logits_coop[val_is_id], val_y_base)
                                 val_batch_loss += val_loss_id
                             # if val_is_ood.any():
-                            #     # 使用 MLMZeroShotClassifier 进行零样本预测，并转换为 logits
-                            #     val_zs_probs_ood_samples, _ = self.zs_classifier_.predict([val_raw_texts[i] for i in torch.where(val_is_ood)[0]])
-                            #     val_zs_probs_ood_samples = val_zs_probs_ood_samples.to(self.device)
-                            #     val_zs_logits_ood_samples = torch.log(val_zs_probs_ood_samples + 1e-8)
+                            #     # Now, zs_classifier_ is an MLP, it takes features directly
+                            #     val_zs_logits_ood_samples = self.zs_classifier_(val_features[val_is_ood])
                             #     val_zs_logits_for_kl_distillation = val_zs_logits_ood_samples[:, self.base_class_global_indices]
 
                             #     val_loss_kl = kl_divergence_loss_from_logits(val_logits_coop[val_is_ood], val_zs_logits_for_kl_distillation)
@@ -523,7 +614,6 @@ class LLMTrafficDECOOP(nn.Module):
 
             for p in self.coop_classifiers[k].parameters():
                 p.requires_grad = False
-
 class DECOOPInferenceEngine:
     def __init__(self, model, eci_thresholds):
         self.model = model
@@ -580,8 +670,11 @@ class DECOOPInferenceEngine:
     def predict(self, batch):
         self.model.eval()
 
+        # Features now contain the pre-fused (textual + numerical) embeddings
         features = batch["features"].to(self.model.device)
-        raw_texts = batch["raw_text"] # 从批次中获取原始文本
+        # raw_texts is NOT needed for MLP-based zs_classifier_
+        # raw_texts = batch["raw_text"] # Removed
+        raw_texts = batch["raw_text"] 
 
         B = features.size(0)
 
@@ -610,17 +703,18 @@ class DECOOPInferenceEngine:
 
                 is_new_sample = (sample_best_non_conf > sample_ecii_thresh) or (sample_best_non_conf > sample_cp_thresh)
 
+                # Assign directly to the pre-allocated list slot
                 pred_types[b] = "NEW" if is_new_sample else "ID"
                 is_new_mask[b] = torch.tensor(is_new_sample, dtype=torch.bool, device=self.model.device)
-
+            
             if is_new_mask.any():
-                new_sample_indices = torch.where(is_new_mask)[0]
-
-                # 使用 LLM 进行零样本预测
-                texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
-                zs_probs_batch, _ = self.model.zs_classifier_.predict(texts_for_mlm) # 返回的是概率
-
-                prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device)
+                new_idxs = torch.where(is_new_mask)[0].tolist()
+                new_texts = [raw_texts[i] for i in new_idxs]
+                #   ── Call MLM Zero‑shot classifier on raw texts ──
+                zs_probs_np, _ = self.model.zs_classifier_.predict(new_texts)  # returns numpy or torch on CPU
+                zs_probs = torch.as_tensor(zs_probs_np, device=self.model.device, dtype=torch.float32)  # (B_new, C_all)
+                # Write the probabilities back to the global prob_vectors tensor
+                prob_vectors[new_idxs] = zs_probs
 
             if (~is_new_mask).any():
                 id_sample_indices = torch.where(~is_new_mask)[0]
@@ -659,6 +753,8 @@ class DECOOPInferenceEngine:
         all_predictions_conformal_sets = []
 
         for batch_idx, batch_data in enumerate(test_dataloader):
+            # batch_data will now contain 'features' (fused) and 'global_labels'
+            # 'raw_texts' is no longer expected as part of batch_data for MLP pipeline
             batch_pred_types, batch_prob_vectors = self.predict(batch_data)
 
             for b in range(batch_prob_vectors.shape[0]):
