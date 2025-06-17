@@ -133,13 +133,13 @@ if __name__ == "__main__":
         model_instance.fit_sub_classifiers(train_dataset,val_dataset)
         print("LLMTrafficDECOOP Model Training Finished.")
 
-        try:
-            torch.save({
-                'model_state_dict': model_instance.state_dict(),
-                'eci_thresholds': model_instance.eci_thresholds
-            }, model_save_path)
-        except Exception as e:
-            print(f"Error saving model: {e}")
+        # try:
+        #     torch.save({
+        #         'model_state_dict': model_instance.state_dict(),
+        #         'eci_thresholds': model_instance.eci_thresholds
+        #     }, model_save_path)
+        # except Exception as e:
+        #     print(f"Error saving model: {e}")
 
 
     # ----------------- Conformal Calibration -----------------
