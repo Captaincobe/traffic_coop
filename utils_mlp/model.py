@@ -9,6 +9,9 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 
+# Import MLMZeroShotClassifier from the LLM utils model
+from utils.model import MLMZeroShotClassifier # 新增导入
+
 # --- Helper for KL Div ---
 def kl_divergence_loss_from_logits(pred_logits, target_logits_detached):
     pred_log_probs = log_softmax(pred_logits, dim=1)
@@ -16,7 +19,7 @@ def kl_divergence_loss_from_logits(pred_logits, target_logits_detached):
     return kl_div(pred_log_probs, target_probs_detached, reduction='batchmean', log_target=False)
 
 # --- Linear Layer ---
-class Linear(nn.Module): 
+class Linear(nn.Module):
     def __init__(self, in_features, out_features, dropout, bias=False):
         super(Linear, self).__init__()
         self.dropout = dropout
@@ -52,15 +55,15 @@ class MLPClassifier(nn.Module):
 
         dropout = 0.5
         super(MLPClassifier, self).__init__()
-        
+
         self.Linear1 = Linear(input_dim, nhid * 2, dropout, bias=True)
         self.Linear2 = Linear(nhid * 2, nhid, dropout, bias=True)
         self.Linear3 = Linear(nhid, num_classes, dropout, bias=True)
 
-        self.use_bn = use_bn 
+        self.use_bn = use_bn
         if self.use_bn:
             self.bn1 = nn.BatchNorm1d(input_dim)
-            self.bn2 = nn.BatchNorm1d(nhid * 2) 
+            self.bn2 = nn.BatchNorm1d(nhid * 2)
             self.bn3 = nn.BatchNorm1d(nhid)
 
     def forward(self, x):
@@ -68,9 +71,9 @@ class MLPClassifier(nn.Module):
             x = self.bn1(x)
         x = F.relu(self.Linear1(x))
         x = F.relu(self.Linear2(x))
-        if self.use_bn:
+        if self.use_bn: # 确保在 Linear3 前应用 BN
             x = self.bn3(x)
-        x = F.relu(self.Linear3(x)) 
+        x = F.relu(self.Linear3(x)) # Note: F.relu on final output is unusual for classification logits. If this is meant to be logits, remove relu.
         return x
 
 
@@ -81,18 +84,18 @@ class LLMTrafficDECOOP(nn.Module):
         self.device = args.DEVICE
         self.k_detectors = args.K_DETECTORS
 
-        self.input_dim = args.INPUT_DIM 
+        self.input_dim = args.INPUT_DIM
         self.num_base_classes = args.NUM_BASE_CLASSES
         self.num_all_classes = args.NUM_ALL_CLASSES
 
         # --- Classifiers ---
-        self.zs_classifier_ = MLPClassifier(
-            input_dim=self.input_dim,
-            hidden_dims=args.MLP_HIDDEN_DIMS_ZS,
-            num_classes=self.num_all_classes
-        ).to(self.device)
-        for param in self.zs_classifier_.parameters():
-            param.requires_grad = False
+        # 零样本分类器现在使用 MLMZeroShotClassifier
+        self.zs_classifier_ = MLMZeroShotClassifier( # 替换为 MLMZeroShotClassifier
+            model_name=args.LLM_MODEL_NAME, # 需要从 args 中获取 LLM 模型名称
+            label_token_map=args.LABEL_TOKEN_MAP, # 需要从 args 中获取标签 token 映射
+            device=self.device
+        )
+        # MLMZeroShotClassifier 内部已经冻结了其模型参数，不需要手动设置 requires_grad = False
 
         self.ood_classifiers = nn.ModuleList([
             MLPClassifier(
@@ -111,7 +114,7 @@ class LLMTrafficDECOOP(nn.Module):
             ).to(self.device)
             for _ in range(self.k_detectors)
         ])
-        
+
         self.eci_thresholds = []
 
     def set_base_class_global_indices(self, base_class_global_indices):
@@ -139,15 +142,15 @@ class LLMTrafficDECOOP(nn.Module):
 
                 for i in range(len(global_labels)):
                     current_global_label = global_labels[i].item()
-                    
+
                     if current_global_label not in self.base_global_set:
                         continue
-                    
+
                     label_base = self.global2base[current_global_label]
-                    
+
                     prob_true_class = probs[i, label_base].item()
                     score = 1.0 - prob_true_class
-                    
+
                     scores_per_class[label_base].append(score)
 
         self.eci_thresholds_k = {}
@@ -160,16 +163,16 @@ class LLMTrafficDECOOP(nn.Module):
                 scores_np = np.array(scores)
                 n_val = len(scores_np)
                 q_level = np.ceil((n_val + 1) * (1 - alpha)) / n_val
-                
+
                 if n_val > 0 and np.allclose(scores_np.min(), scores_np.max(), atol=1e-6) and scores_np.max() > 0.95:
                     print(f"[ECII] Warning: local class {cls_local_idx} score distribution is very narrow (min={scores_np.min():.4f}, max={scores_np.max():.4f})")
-                
+
                 try:
                     thresh = float(np.quantile(scores_np, q_level))
                 except Exception as e:
                     print(f"[ECII] Error calculating quantile for local class {cls_local_idx}: {e}. Using fallback threshold=1.0")
                     thresh = 1.0
-                
+
                 self.eci_thresholds_k[cls_local_idx] = thresh
                 print(f"[ECII] class {cls_local_idx} | q@{1-alpha:.2f} = {self.eci_thresholds_k[cls_local_idx]:.4f}, N={len(scores)}")
         print(f"[ECII] Thresholds for detector {k}: {self.eci_thresholds_k}")
@@ -179,7 +182,7 @@ class LLMTrafficDECOOP(nn.Module):
     def forward_ood_batch_mlp(self, features):
         all_logits = []
         for k in range(self.k_detectors):
-            self.ood_classifiers[k].eval() 
+            self.ood_classifiers[k].eval()
             logits_k = self.ood_classifiers[k](features)
             all_logits.append(logits_k.unsqueeze(-1))
         return torch.cat(all_logits, dim=-1)
@@ -187,7 +190,7 @@ class LLMTrafficDECOOP(nn.Module):
     def forward_coop_batch_mlp(self, features):
         all_logits = []
         for k in range(self.k_detectors):
-            self.coop_classifiers[k].eval() 
+            self.coop_classifiers[k].eval()
             logits_k = self.coop_classifiers[k](features)
             all_logits.append(logits_k.unsqueeze(-1))
         return torch.cat(all_logits, dim=-1)
@@ -199,7 +202,7 @@ class LLMTrafficDECOOP(nn.Module):
 
         dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=16)
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=16)
-        
+
         self.ood_classifiers[k].train()
 
         optimizer = torch.optim.AdamW(
@@ -266,12 +269,12 @@ class LLMTrafficDECOOP(nn.Module):
                     for g, b in self.global2base.items():
                         mapping_tensor[g] = b
                     y_base = mapping_tensor[global_labels[is_id]]
-                    
+
                     if (y_base == -1).any():
                         raise ValueError("Invalid local label (-1) found for ID samples during OOD detector training. Check data mapping.")
 
                     loss_id = loss_fn(logits[is_id], y_base)
-                    
+
                     preds = torch.argmax(logits[is_id], dim=1)
                     total_correct += (preds == y_base).sum().item()
                     total_id_samples += is_id.sum().item()
@@ -327,7 +330,7 @@ class LLMTrafficDECOOP(nn.Module):
                             val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
                             val_loss_id = loss_fn(val_logits[val_is_id], val_y_base)
                             total_val_loss += val_loss_id.item()
-                    
+
                     avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
                     print(f"[DetectorTraining][Epoch {epoch+1}/{self.args.NUM_EPOCHS}] Val Loss: {avg_val_loss:.4f}")
 
@@ -393,7 +396,7 @@ class LLMTrafficDECOOP(nn.Module):
 
             for ood_det in self.ood_classifiers:
                 ood_det.eval()
-            self.zs_classifier_.eval()
+            # self.zs_classifier_.eval() # MLMZeroShotClassifier 不会有 train/eval 模式
 
 
             for epoch in range(self.args.N_EPOCHS_SUBCLASSIFIER):
@@ -403,6 +406,7 @@ class LLMTrafficDECOOP(nn.Module):
                 for batch in dataloader:
                     features = batch["features"].to(self.device)
                     global_labels = batch["global_labels"].to(self.device)
+                    raw_texts = batch["raw_text"] # 获取原始文本
 
                     optimizer.zero_grad()
 
@@ -426,13 +430,17 @@ class LLMTrafficDECOOP(nn.Module):
 
                             if (y_base == -1).any():
                                 raise ValueError("Invalid local label (-1) found for ID samples during COOP classifier training. Check data mapping.")
-                            
+
                             loss_id = cross_entropy(logits_coop[is_id], y_base)
                             loss += loss_id
-                        
+
                         if is_ood.any():
                             with torch.no_grad():
-                                zs_logits_ood_samples = self.zs_classifier_(features[is_ood])
+                                # 使用 MLMZeroShotClassifier 进行零样本预测，并转换为 logits
+                                zs_probs_ood_samples, _ = self.zs_classifier_.predict([raw_texts[i] for i in torch.where(is_ood)[0]])
+                                # 为了 KL Div，需要将 probs 转换为 logits (log_softmax 的逆操作)
+                                zs_probs_ood_samples = zs_probs_ood_samples.to(self.device)
+                                zs_logits_ood_samples = torch.log(zs_probs_ood_samples + 1e-8) # 转换为 log-space logits
                                 zs_logits_for_kl_distillation = zs_logits_ood_samples[:, self.base_class_global_indices]
 
                             loss_kl = kl_divergence_loss_from_logits(
@@ -444,7 +452,7 @@ class LLMTrafficDECOOP(nn.Module):
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
-                        self.coop_classifiers[k].parameters(),
+                        self.coop_classifiers[k].parameters(), # 只有 coop_classifiers 的参数需要裁剪
                         max_norm=1.0
                     )
 
@@ -464,6 +472,7 @@ class LLMTrafficDECOOP(nn.Module):
                         for val_batch in val_dataloader:
                             val_features = val_batch["features"].to(self.device)
                             val_global_labels = val_batch["global_labels"].to(self.device)
+                            val_raw_texts = val_batch["raw_text"] # 获取原始文本
 
                             val_logits_ood = self.ood_classifiers[k](val_features)
                             val_probs_ood  = softmax(val_logits_ood, dim=1)
@@ -482,15 +491,18 @@ class LLMTrafficDECOOP(nn.Module):
                                 val_y_base = val_mapping_tensor[val_global_labels[val_is_id]]
                                 val_loss_id = cross_entropy(val_logits_coop[val_is_id], val_y_base)
                                 val_batch_loss += val_loss_id
-                            if val_is_ood.any():
-                                val_zs_logits_ood_samples = self.zs_classifier_(val_features[val_is_ood])
-                                val_zs_logits_for_kl_distillation = val_zs_logits_ood_samples[:, self.base_class_global_indices]
+                            # if val_is_ood.any():
+                            #     # 使用 MLMZeroShotClassifier 进行零样本预测，并转换为 logits
+                            #     val_zs_probs_ood_samples, _ = self.zs_classifier_.predict([val_raw_texts[i] for i in torch.where(val_is_ood)[0]])
+                            #     val_zs_probs_ood_samples = val_zs_probs_ood_samples.to(self.device)
+                            #     val_zs_logits_ood_samples = torch.log(val_zs_probs_ood_samples + 1e-8)
+                            #     val_zs_logits_for_kl_distillation = val_zs_logits_ood_samples[:, self.base_class_global_indices]
 
-                                val_loss_kl = kl_divergence_loss_from_logits(val_logits_coop[val_is_ood], val_zs_logits_for_kl_distillation)
-                                val_batch_loss += self.args.KL_COEFF * val_loss_kl
-                            
+                            #     val_loss_kl = kl_divergence_loss_from_logits(val_logits_coop[val_is_ood], val_zs_logits_for_kl_distillation)
+                            #     val_batch_loss += self.args.KL_COEFF * val_loss_kl
+
                             total_val_loss += val_batch_loss.item()
-                
+
                     avg_val_loss = total_val_loss / (len(val_dataloader) if len(val_dataloader) > 0 else 1)
                     print(f"[Epoch {epoch+1}/{self.args.N_EPOCHS_SUBCLASSIFIER}] Val Loss: {avg_val_loss:.4f}")
 
@@ -517,9 +529,8 @@ class DECOOPInferenceEngine:
         self.model = model
         self.eci_thresholds = eci_thresholds
 
-    def calibrate_q_hat(self, calibration_dataset, alpha_cp):
-        val_batch_size = self.model.args.BATCH_SIZE
-        val_dataloader = DataLoader(calibration_dataset, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=16)
+    def calibrate_q_hat(self, calibration_dataset, alpha=0.1): # Renamed alpha_cp to alpha for consistency with utils_mlp/model.py eci_calibration
+        dataloader = DataLoader(calibration_dataset, batch_size=self.model.args.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=16)
 
         all_non_conformity_scores_val = []
 
@@ -530,9 +541,10 @@ class DECOOPInferenceEngine:
             q_hat = 0.9
         else:
             with torch.no_grad():
-                for batch_data in val_dataloader:
-                    _, batch_prob_vectors = self.predict(batch_data)
-                    
+                for batch_data in dataloader:
+                    # Note: predict method now requires 'raw_text' in batch_data
+                    _, batch_prob_vectors = self.predict(batch_data) # This predict will use the new ZS classifier
+
                     batch_global_labels = batch_data['global_labels'].cpu().numpy()
 
                     for b in range(batch_prob_vectors.shape[0]):
@@ -541,32 +553,39 @@ class DECOOPInferenceEngine:
 
                         if sample_global_label not in base_class_set:
                             continue
-                        
+
                         try:
-                            score = 1.0 - sample_probas[sample_global_label]
-                        except IndexError: 
+                            # 确保 sample_global_label 在 sample_probas 的有效索引范围内
+                            if sample_global_label >= len(sample_probas): # Changed shape[0] to len(sample_probas) for 1D array
+                                print(f"Warning: Global label {sample_global_label} out of bounds for probas shape {sample_probas.shape}. Using score 1.0.")
+                                score = 1.0
+                            else:
+                                prob_true_class = sample_probas[sample_global_label]
+                                score = 1.0 - prob_true_class
+                        except IndexError:
                             print(f"Warning: IndexError during score calculation for global label {sample_global_label}. Probas shape: {sample_probas.shape}")
                             score = 1.0
-                        
+
                         all_non_conformity_scores_val.append(score)
 
             all_non_conformity_scores_val = np.array(all_non_conformity_scores_val)
             n_val = len(all_non_conformity_scores_val)
-            q_level = np.ceil((n_val + 1) * (1 - alpha_cp)) / n_val
+            q_level = np.ceil((n_val + 1) * (1 - alpha)) / n_val
+            # Handle empty scores array case
             q_hat = np.quantile(all_non_conformity_scores_val, q_level) if n_val > 0 else 0.9
-        
+
         self.model.args.CP_OOD_THRESHOLD = q_hat
         print(f"Validation complete. q_hat = {q_hat:.4f}")
 
     def predict(self, batch):
         self.model.eval()
-        
+
         features = batch["features"].to(self.model.device)
+        raw_texts = batch["raw_text"] # 从批次中获取原始文本
 
         B = features.size(0)
 
-        # Pre-allocate pred_types list with correct size to guarantee length
-        pred_types = [""] * B 
+        pred_types = [""] * B
         prob_vectors = torch.zeros(B, self.model.num_all_classes, device=self.model.device)
 
         with torch.no_grad():
@@ -582,45 +601,45 @@ class DECOOPInferenceEngine:
 
             for b in range(B):
                 sample_best_k = best_k_indices[b].item()
-                
-                sample_pred_base_local_idx = pred_bases_local_idx[b, sample_best_k].item() 
+
+                sample_pred_base_local_idx = pred_bases_local_idx[b, sample_best_k].item()
                 sample_best_non_conf = float(non_conf[b, sample_best_k])
 
                 sample_ecii_thresh = self.eci_thresholds[sample_best_k].get(sample_pred_base_local_idx, 1.0)
                 sample_cp_thresh = getattr(self.model.args, "CP_OOD_THRESHOLD", 1.0)
 
                 is_new_sample = (sample_best_non_conf > sample_ecii_thresh) or (sample_best_non_conf > sample_cp_thresh)
-                
-                # Assign directly to the pre-allocated list slot
+
                 pred_types[b] = "NEW" if is_new_sample else "ID"
                 is_new_mask[b] = torch.tensor(is_new_sample, dtype=torch.bool, device=self.model.device)
 
             if is_new_mask.any():
                 new_sample_indices = torch.where(is_new_mask)[0]
-                
-                zs_logits_batch = self.model.zs_classifier_(features[new_sample_indices])
-                zs_probs_batch = softmax(zs_logits_batch, dim=1)
-                
+
+                # 使用 LLM 进行零样本预测
+                texts_for_mlm = [raw_texts[idx] for idx in new_sample_indices.cpu().tolist()]
+                zs_probs_batch, _ = self.model.zs_classifier_.predict(texts_for_mlm) # 返回的是概率
+
                 prob_vectors[new_sample_indices] = zs_probs_batch.to(self.model.device)
 
             if (~is_new_mask).any():
                 id_sample_indices = torch.where(~is_new_mask)[0]
-                
+
                 logits_coop_all_k = self.model.forward_coop_batch_mlp(features[id_sample_indices])
 
                 best_k_for_id_samples = best_k_indices[id_sample_indices]
-                
+
                 best_k_expanded = best_k_for_id_samples.view(-1, 1, 1).expand(-1, logits_coop_all_k.size(1), -1)
-                
+
                 selected_coop_logits = torch.gather(logits_coop_all_k, dim=2, index=best_k_expanded).squeeze(2)
-                
+
                 probs_id_batch = softmax(selected_coop_logits, dim=1)
 
                 global_indices_of_base_classes = torch.tensor(
                     sorted(list(self.model.base_global_set)),
                     dtype=torch.long, device=self.model.device
                 )
-                
+
                 prob_vectors[id_sample_indices[:, None], global_indices_of_base_classes] = probs_id_batch.to(self.model.device)
 
         return pred_types, prob_vectors.cpu().numpy()
@@ -631,14 +650,14 @@ class DECOOPInferenceEngine:
         Performs batch inference on the given dataset and collects all prediction results.
         """
         print(f"\nPredicting on Test set with Conformal Prediction...")
-        
-        test_batch_size = self.model.args.BATCH_SIZE 
+
+        test_batch_size = self.model.args.BATCH_SIZE
         test_dataloader = DataLoader(dataset, batch_size=test_batch_size, shuffle=False, pin_memory=True, num_workers=16)
 
         all_point_preds_global = []
         all_prob_matrix_all_classes = []
         all_predictions_conformal_sets = []
-        
+
         for batch_idx, batch_data in enumerate(test_dataloader):
             batch_pred_types, batch_prob_vectors = self.predict(batch_data)
 
@@ -652,8 +671,8 @@ class DECOOPInferenceEngine:
                 all_prob_matrix_all_classes.append(sample_probas)
 
                 cp_set = []
-                current_q_hat = self.model.args.CP_OOD_THRESHOLD 
-                for global_idx_in_all_classes in range(self.model.args.NUM_ALL_CLASSES): 
+                current_q_hat = self.model.args.CP_OOD_THRESHOLD
+                for global_idx_in_all_classes in range(self.model.args.NUM_ALL_CLASSES):
                     if 1.0 - sample_probas[global_idx_in_all_classes] <= current_q_hat:
                         cp_set.append(global_idx_in_all_classes)
                 all_predictions_conformal_sets.append(cp_set)
@@ -661,5 +680,5 @@ class DECOOPInferenceEngine:
         point_preds_global = np.array(all_point_preds_global)
         prob_matrix_all_classes = np.array(all_prob_matrix_all_classes)
         predictions_conformal_sets = all_predictions_conformal_sets
-        
+
         return point_preds_global, prob_matrix_all_classes, predictions_conformal_sets

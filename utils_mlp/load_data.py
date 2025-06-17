@@ -8,6 +8,9 @@ import torch
 # Import the refactored Dataset class
 from utils_mlp.Dataloader import MLPCSVTrafficDataset
 
+# Import convert_feature_to_prompt_text from the LLM utils Dataloader
+from utils.Dataloader import convert_feature_to_prompt_text # 新增导入
+
 # Helper function to get the list of features that are expected to be standardized
 # and used as input to the MLP. This function replicates the relevant part
 # from `datasets/preprocess.py` to ensure consistency in feature selection.
@@ -95,8 +98,8 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
     ood_suffix = "_".join(sorted(ood_labels_to_exclude)) if ood_labels_to_exclude else "all_base"
 
-    # Changed cache file name to reflect storage of numerical data
-    cache_file_name = f"numerical_{ood_suffix}_few_shot_{num_samples_per_class}.pt"
+    # Changed cache file name to reflect storage of numerical data and LLM ZS usage
+    cache_file_name = f"numerical_llm_zs_{ood_suffix}_{num_samples_per_class}.pt" # 更新缓存文件名以反映 LLM ZS 分类器
     cache_file = os.path.join(dataset_root, dataset_name, "raw", cache_file_name)
 
     # Get the list of feature columns that will be extracted for MLP input
@@ -112,6 +115,9 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         args.NUM_BASE_CLASSES = cached["args"].NUM_BASE_CLASSES
         args.NUM_ALL_CLASSES = cached["args"].NUM_ALL_CLASSES
         args.INPUT_DIM = cached["args"].INPUT_DIM # Load the input dimension
+        # Ensure LLM-related args are loaded from cache if needed
+        args.LLM_MODEL_NAME = cached["args"].LLM_MODEL_NAME
+        args.LABEL_TOKEN_MAP = cached["args"].LABEL_TOKEN_MAP
         base_class_global_indices_sorted = cached["base_class_indices"]
     else:
         df = pd.read_csv(csv_path)
@@ -136,7 +142,7 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         args.NUM_ALL_CLASSES = len(all_class_labels_global_map)
 
         base_class_global_indices_sorted = sorted([all_class_labels_global_map[l] for l in base_traffic_labels_str])
-        
+
         # --- Dataset Splitting Logic (unchanged from original) ---
         min_samples_for_stratify_df = df['label'].value_counts().min() >= 2 and len(df['label'].unique()) > 1
         df_train_val_pool, df_test_full = train_test_split(
@@ -150,19 +156,19 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
         for label_str in base_traffic_labels_str:
             class_df = df_base_pool[df_base_pool['label'] == label_str]
-            
+
             if len(class_df) < num_samples_per_class:
                 print(f"Warning: Not enough samples ({len(class_df)}) for class '{label_str}' to get {num_samples_per_class} for train. Taking all available.")
                 train_samples = class_df.sample(frac=1, random_state=42)
             else:
                 train_samples = class_df.sample(n=num_samples_per_class, random_state=42)
-            
+
             df_train_decoop = pd.concat([df_train_decoop, train_samples], ignore_index=True)
 
         train_indices_used = df_train_decoop.index
 
         df_remaining_base_for_val = df_base_pool.drop(train_indices_used, errors='ignore')
-        
+
         df_val = pd.concat([df_remaining_base_for_val, df_new_pool], ignore_index=True).sample(frac=1, random_state=42)
 
         df_test = df_test_full
@@ -173,9 +179,9 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         print(f"Base classes for training: {base_traffic_labels_str}")
         if new_traffic_labels_str:
             print(f"New/OOD classes for evaluation: {new_traffic_labels_str}")
-        
+
         print("\n--- Checking Class Distribution in Test Set (df_test) ---")
-        
+
         test_class_counts_str = df_test['label'].value_counts().sort_index()
         print("Test set (df_test) class counts (string labels):")
         print(test_class_counts_str)
@@ -186,7 +192,7 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             global_idx = all_class_labels_global_map.get(label_str)
             if global_idx is not None:
                 global_test_class_counts[global_idx] = count
-        
+
         sorted_global_test_class_counts = sorted(global_test_class_counts.items())
         for global_idx, count in sorted_global_test_class_counts:
             local_base_idx_info = ''
@@ -196,13 +202,13 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         print("------------------------------------------------------")
 
         # New function to process DataFrame into numerical samples for MLP
-        def process_dataframe_for_mlp(dataframe, feature_columns_for_extraction, all_class_labels_global_map_local, is_training_data_flag, base_class_global_indices_local=None):
+        def process_dataframe_for_mlp(dataframe, feature_columns_for_extraction, all_class_labels_global_map_local, is_training_data_flag, base_class_global_indices_local=None, dataset_name_for_text=None): # 添加 dataset_name_for_text
             """
             Processes a pandas DataFrame to extract numerical features and labels,
-            suitable for MLP training.
+            suitable for MLP training, and includes raw_text for LLM ZS classifier.
             """
             processed_list = []
-            
+
             global_to_local_base_map = None
             if is_training_data_flag:
                 if base_class_global_indices_local is None or not all_class_labels_global_map_local:
@@ -234,28 +240,32 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
                 if not (isinstance(target_label_numerical, int) and target_label_numerical >= 0):
                     raise ValueError(f"Label mapping error at idx={idx}: mapped label ({target_label_numerical}) is not a valid non-negative integer. Original label: {global_label_str} ({global_label_numerical})")
 
+                # 为 LLM ZS 分类器生成原始文本
+                full_input_text = convert_feature_to_prompt_text(dataset_name_for_text, row) # 使用完整的 row 来生成文本
+
                 processed_list.append({
-                    "features": numerical_features, # Replaced 'input_ids'/'attention_mask'
+                    "features": numerical_features,
                     "labels": torch.tensor(target_label_numerical, dtype=torch.long), # Local base class index or global index
                     "global_labels": torch.tensor(global_label_numerical, dtype=torch.long), # Always global index
+                    "raw_text": full_input_text # 新增原始文本字段
                 })
             return processed_list
 
 
-        train_numerical_list = process_dataframe_for_mlp(df_train_decoop, feature_cols, all_class_labels_global_map, is_training_data_flag=True, base_class_global_indices_local=base_class_global_indices_sorted)
-        val_numerical_list = process_dataframe_for_mlp(df_val, feature_cols, all_class_labels_global_map, is_training_data_flag=False)
-        test_numerical_list = process_dataframe_for_mlp(df_test, feature_cols, all_class_labels_global_map, is_training_data_flag=False)
+        train_numerical_list = process_dataframe_for_mlp(df_train_decoop, feature_cols, all_class_labels_global_map, is_training_data_flag=True, base_class_global_indices_local=base_class_global_indices_sorted, dataset_name_for_text=args.dataset_name)
+        val_numerical_list = process_dataframe_for_mlp(df_val, feature_cols, all_class_labels_global_map, is_training_data_flag=False, dataset_name_for_text=args.dataset_name)
+        test_numerical_list = process_dataframe_for_mlp(df_test, feature_cols, all_class_labels_global_map, is_training_data_flag=False, dataset_name_for_text=args.dataset_name)
 
         train_dataset = MLPCSVTrafficDataset(train_numerical_list)
         val_dataset = MLPCSVTrafficDataset(val_numerical_list)
         test_dataset = MLPCSVTrafficDataset(test_numerical_list)
-        
+
         # Save processed numerical data to cache
         torch.save({
             "train_numerical_list": train_numerical_list,
             "val_numerical_list": val_numerical_list,
             "test_numerical_list": test_numerical_list,
-            "args": args, # Save updated args (now contains INPUT_DIM)
+            "args": args, # Save updated args (now contains INPUT_DIM, LLM_MODEL_NAME, LABEL_TOKEN_MAP)
             "base_class_indices": base_class_global_indices_sorted,
             "ood_labels_excluded": ood_labels_to_exclude
         }, cache_file)

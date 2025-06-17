@@ -16,6 +16,7 @@ class MLPCSVTrafficDataset(Dataset):
         - 'features': a torch.Tensor of numerical feature vectors
         - 'labels': a torch.Tensor (long) for local (base) class index
         - 'global_labels': a torch.Tensor (long) for global class index
+        - 'raw_text': (Optional) A string representation of features for LLM input. # 新增注释，明确支持 raw_text
         """
         self.data_list = data_list
 
@@ -30,4 +31,3 @@ class MLPCSVTrafficDataset(Dataset):
         Retrieves a sample from the dataset at the given index.
         """
         return self.data_list[idx]
-    
