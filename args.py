@@ -5,12 +5,12 @@ def parameter_parser():
     parser = argparse.ArgumentParser(description="Configuration and Hyperparameters for Model Training")
     parser.add_argument('--num_base_classes', dest='NUM_BASE_CLASSES', type=int, default=-1)
     parser.add_argument('--num_all_classes', dest='NUM_ALL_CLASSES', type=int, default=-1)
-    parser.add_argument("--LLM_MODEL_NAME",
+    parser.add_argument("--PRE_MODEL",
                         default="datasetsM/ISCXVPN2016/ft_ckpt") 
     # Add LLM-specific parameters for MLMZeroShotClassifier
-    # parser.add_argument('--LLM_MODEL_NAME', type=str, default="bert-base-uncased", # Or "FacebookAI/roberta-base"
-    #                     choices=["bert-base-uncased","FacebookAI/roberta-base"],
-    #                     help='Name of the pre-trained LLM model to use for Zero-Shot Classification.')
+    parser.add_argument('--LLM_MODEL_NAME', type=str, default="bert-base-uncased", # Or "FacebookAI/roberta-base"
+                        choices=["bert-base-uncased","FacebookAI/roberta-base"],
+                        help='Name of the pre-trained LLM model to use for Zero-Shot Classification.')
     parser.add_argument('--max_seq_length', dest='MAX_SEQ_LENGTH', type=int, default=128,
                     help='Maximum sequence length for LLM input.')
     parser.add_argument('--label_token_map', dest='LABEL_TOKEN_MAP', default=
@@ -21,7 +21,7 @@ def parameter_parser():
         "VOIP":"call",  "P2P":"sharing", "VPN-CHAT":"vpnchat"
     }, help='Mapping from traffic labels to their verbalizer tokens for LLM zero-shot classification.')
     # 注意：这里的 LABEL_TOKEN_MAP 需要根据你的数据集和具体标签进行调整。
-
+    parser.add_argument('--ood', type=str, nargs='+', default=['VOIP'])
 
     parser.add_argument('--dataset_name', type=str, default='ISCXVPN2016',
                         choices=["ISCXVPN2016", "ISCXTor2016", "USTC-TFC2016", "CIC-Darknet2020"])
@@ -57,9 +57,9 @@ def parameter_parser():
 
 
     # OOD/ID Loss Regularization
-    parser.add_argument("--OOD_MARGIN", type=float, default=0.4,
+    parser.add_argument("--OOD_MARGIN", type=float, default=0.1,
                         help="Margin for the entropy-based OOD loss.")
-    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.1,
+    parser.add_argument("--LAMBDA_ENTROPY", type=float, default=0.3,
                         help="Weight for the entropy regularization term in OOD prompt training.")
     parser.add_argument("--KL_COEFF", type=float, default=0.4,
                         help="Coefficient for KL divergence loss in COOP training.")
@@ -79,7 +79,7 @@ def parameter_parser():
     # Plateau scheduler parameters
     parser.add_argument("--PLATEAU_FACTOR", type=float, default=0.1,
                         help="Factor by which the learning rate will be reduced.")
-    parser.add_argument("--PLATEAU_PATIENCE", type=int, default=7,
+    parser.add_argument("--PLATEAU_PATIENCE", type=int, default=10,
                         help="Number of epochs with no improvement after which learning rate will be reduced.")
 
 

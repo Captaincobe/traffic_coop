@@ -1,21 +1,16 @@
 # main_mlp.py (Modified)
 
 import os
-import pandas as pd
+
 import torch
-# from datasets.preprocess import Z_Scaler
-from datasetsM.preprocess import Z_Scaler
-from utils.load_data import _get_features_to_standardize_for_loading, loadData # Import the refactored data loading function
+from utils.load_data import fuse_features_and_cache, loadData # Import the refactored data loading function
 import numpy as np
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.preprocessing import label_binarize
 from args import parameter_parser # Import argument parser
 from utils.model import DECOOPInferenceEngine, LLMTrafficDECOOP # Import the refactored model and inference engine
 
-# Import necessary components for feature fusion
-from transformers import AutoTokenizer, AutoModel # For LLM embedding
-# from datasets.preprocess import Z_Scaler, _get_features_to_standardize_for_loading as get_numerical_features_config
-from utils.Dataloader import convert_feature_to_prompt_text
+
 
 
 # Suppress tokenizers parallelism warning if it appears (less relevant for MLP but harmless)
@@ -31,7 +26,7 @@ dataset_name = args.dataset_name
 # This is crucial for consistent label handling across the entire pipeline.
 if dataset_name == "ISCXVPN2016":
     all_labels_list = ["VPN-MAIL", "VPN-STREAMING", "VPN-VOIP", "VPN-BROWSING","CHAT","STREAMING","MAIL","FT","VPN-FT", "P2P", "BROWSING", "VOIP", "VPN-P2P","VPN-CHAT"]
-    ood_labels_for_this_run = ["VOIP"] # Example OOD class for this specific run
+    ood_labels_for_this_run = args.ood # Example OOD class for this specific run
 elif dataset_name == "ISCXTor2016":
     all_labels_list = ['AUDIO', 'BROWSING', 'CHAT', 'FILE-TRANSFER', 'MAIL', 'P2P', 'VIDEO', 'VOIP']
     ood_labels_for_this_run = ["VOIP"] # Example OOD class for this specific run
@@ -43,90 +38,6 @@ all_class_labels_global_map = {label: i for i, label in enumerate(all_labels_lis
 
 print(f"Using device: {DEVICE}")
 
-# --- NEW: Pre-fuse textual and numerical features using LLM embeddings ---
-# This function is defined inline for demonstration but could be a separate utility.
-def fuse_features_and_cache(args, all_labels_list, all_class_labels_global_map, ood_labels_to_exclude, dataset_name):
-
-    # Get paths
-    dataset_root = '/home/icdm/code/trafficCOOP/datasetsM'
-    csv_path_raw = os.path.join(dataset_root, dataset_name, 'raw',f"{dataset_name}.csv") # Original raw CSV
-
-    # unmapped = [l for l in pd.read_csv(csv_path_raw)['label'].unique()
-    #             if l not in all_class_labels_global_map]
-    # print(f"Unmapped labels: {unmapped}")
-    # Define cache file for fused features
-    ood_suffix = "_".join(sorted(ood_labels_to_exclude)) if ood_labels_to_exclude else "all_base"
-    fused_cache_file_name = f"fused_features_for_mlp_{ood_suffix}_few_shot_{args.SAMPLES_PER_CLASS}.pt"
-    fused_cache_file = os.path.join(dataset_root, dataset_name, "raw", fused_cache_file_name)
-
-    if os.path.exists(fused_cache_file):
-        print(f"Loading pre-fused features from cache: {fused_cache_file}")
-        return torch.load(fused_cache_file)
-    
-    # Load tokenizer and LLM for generating textual embeddings
-    tokenizer = AutoTokenizer.from_pretrained(args.LLM_MODEL_NAME)
-    llm_model = AutoModel.from_pretrained(args.LLM_MODEL_NAME).to(args.DEVICE)
-    llm_model.eval() # Set LLM to evaluation mode, as we're only extracting features
-    print("\n--- Starting Pre-fusion of Textual and Numerical Features ---")
-
-    df_raw = pd.read_csv(csv_path_raw)
-    numerical_feature_cols = _get_features_to_standardize_for_loading(dataset_name)
-
-    # Fit numerical scaler on the full raw dataset
-    numerical_scaler = Z_Scaler()
-    numerical_scaler.fit_transform(df_raw[numerical_feature_cols].copy())
-
-    fused_data_list = []
-    
-    llm_embedding_dim = llm_model.config.hidden_size 
-    numerical_output_dim = len(numerical_feature_cols) 
-
-    print(f"LLM embedding dimension: {llm_embedding_dim}")
-    print(f"Numerical features dimension: {numerical_output_dim}")
-    print(f"Total fused feature dimension for MLP: {llm_embedding_dim + numerical_output_dim}")
-
-    for idx, row in df_raw.iterrows():
-        global_label_str = row['label']
-        global_label_numerical = all_class_labels_global_map.get(global_label_str)
-        if global_label_numerical is None:
-            continue # Skip if label not in map
-
-        # 1. Get Textual Embedding from LLM
-        feature_text = convert_feature_to_prompt_text(dataset_name, row)
-        full_input_text = f"Traffic classification sample: {feature_text}"
-        
-        tokenized_input = tokenizer(
-            full_input_text,
-            truncation=True,
-            max_length=args.MAX_SEQ_LENGTH,
-            padding="max_length",
-            return_tensors="pt"
-        ).to(args.DEVICE)
-
-        with torch.no_grad():
-            outputs = llm_model(**tokenized_input)
-            textual_embedding = outputs.last_hidden_state[:, 0].squeeze(0).cpu() # (H,)
-
-        # 2. Get Scaled Numerical Features
-        numerical_features_raw = row[numerical_feature_cols].values
-        # numerical_features_scaled = numerical_scaler.fit_transform(numerical_features_raw.reshape(1, -1)).squeeze(0)
-        numerical_features_scaled = numerical_scaler.fit_transform(
-            row[numerical_feature_cols].values.reshape(1, -1)
-        ).squeeze(0)
-        numerical_features_tensor = torch.tensor(numerical_features_scaled.astype(float), dtype=torch.float32)
-        # 3. Concatenate (Fuse) them
-        fused_vector = torch.cat([textual_embedding, numerical_features_tensor], dim=0) # (H + Num_Numerical_Features,)
-
-        fused_data_list.append({
-            "fused_features": fused_vector,
-            "global_labels": torch.tensor(global_label_numerical, dtype=torch.long)
-        })
-    
-    torch.save(fused_data_list, fused_cache_file)
-    print(f"Pre-fused features saved to: {fused_cache_file}")
-    print(f"Total fused samples: {len(fused_data_list)}")
-    
-    return fused_data_list
 
 # Call the feature fusion function
 fused_data = fuse_features_and_cache(args, all_labels_list, all_class_labels_global_map, ood_labels_for_this_run, dataset_name)
