@@ -189,7 +189,7 @@ class LLMTrafficDECOOP(nn.Module):
 
         # --- Zero‑shot classifier (MLM) ---
         self.zs_classifier_ = MLMZeroShotClassifier(
-            model_name=args.LLM_MODEL_NAME,          # e.g. "bert-base-uncased"
+            model_name=args.PRE_MODEL,          # e.g. "bert-base-uncased"
             label_token_map=args.LABEL_TOKEN_MAP,    # map global label → verbalizer
             device=self.device
         )

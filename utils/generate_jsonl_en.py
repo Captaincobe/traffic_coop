@@ -97,5 +97,5 @@ def main():
 
 if __name__ == "__main__":
     # Import the global label map from your main script (adjust import path as needed)
-    from main_mlp import all_class_labels_global_map
+    from main import all_class_labels_global_map
     main()
