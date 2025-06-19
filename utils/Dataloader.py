@@ -7,10 +7,6 @@ import torch
 
 
 class MLPCSVTrafficDataset(Dataset):
-    """
-    A PyTorch Dataset for traffic data, designed to load pre-processed
-    numerical features for MLP models.
-    """
     def __init__(self, data_list):
         """
         Initializes the dataset with a list of pre-processed data samples.
@@ -18,14 +14,11 @@ class MLPCSVTrafficDataset(Dataset):
         - 'features': a torch.Tensor of numerical feature vectors
         - 'labels': a torch.Tensor (long) for local (base) class index
         - 'global_labels': a torch.Tensor (long) for global class index
-        - 'raw_text': (Optional) A string representation of features for LLM input. # 新增注释，明确支持 raw_text
+        - 'raw_text': (Optional) A string representation of features for LLM input.
         """
         self.data_list = data_list
 
     def __len__(self):
-        """
-        Returns the total number of samples in the dataset.
-        """
         return len(self.data_list)
 
     def __getitem__(self, idx):
@@ -35,12 +28,8 @@ class MLPCSVTrafficDataset(Dataset):
         return self.data_list[idx]
     
 
-
-def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_labels_to_exclude=None, prefused_data_list=None):
+def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_labels_to_exclude=[], prefused_data_list=None):
     """
-    Loads, splits, and processes traffic data for MLP training and evaluation.
-    Handles caching of processed numerical data.
-    
     Args:
         args: An argparse.Namespace object containing configuration parameters
               like `dataset_name`, `SAMPLES_PER_CLASS`, `DEVICE`, etc.
@@ -57,32 +46,34 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
     dataset_name = args.dataset_name
     num_samples_per_class = args.SAMPLES_PER_CLASS
 
-    if ood_labels_to_exclude is None:
-        ood_labels_to_exclude = []
 
     base_traffic_labels_str = [label for label in full_traffic_labels_list if label not in ood_labels_to_exclude]
     new_traffic_labels_str = [label for label in full_traffic_labels_list if label in ood_labels_to_exclude]
     dataset_root='/home/icdm/code/trafficCOOP/datasetsM'
 
-    # ------------------------------------------------------------------
-    # Optional split‑cache: if the train/val/test lists were saved before
-    # for this few‑shot setting, load them directly to skip re‑splitting.
-    # ------------------------------------------------------------------
+    DEFAULT_COMPONENTS = ["textual_emb", "numerical_feats",
+                          "explanation_emb", "prior_logits"]
+    selected_components = getattr(args, "SELECTED_COMPONENTS", DEFAULT_COMPONENTS)
+    selected_components = [str(c) for c in selected_components]
+
+    component_order = ["textual_emb", "numerical_feats",
+                       "explanation_emb", "prior_logits"]
+    comp_id = 0
+    for i, comp in enumerate(component_order):
+        if comp in selected_components:
+            comp_id |= (1 << i)
+
     split_cache_file = os.path.join(
         dataset_root, dataset_name, "raw",
-        f"splits_SPC{num_samples_per_class}.pt"
+        f"splits_{comp_id}_SPC{num_samples_per_class}.pt"
     )
     if os.path.exists(split_cache_file):
         print(f"Loading cached train/val/test splits from: {split_cache_file}")
         cached_splits = torch.load(split_cache_file)
 
-        # Restore INPUT_DIM from the first sample
-        if not cached_splits["train"]:
-            raise ValueError("Cached split file is empty – cannot restore INPUT_DIM.")
         args.INPUT_DIM = cached_splits["train"][0]["features"].shape[0]
         print(f"[Split‑Cache] Restored INPUT_DIM={args.INPUT_DIM}")
 
-        # Ensure NUM_BASE_CLASSES / NUM_ALL_CLASSES are consistent
         args.NUM_BASE_CLASSES = len(base_traffic_labels_str)
         args.NUM_ALL_CLASSES  = len(all_class_labels_global_map)
 
@@ -94,39 +85,29 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             [all_class_labels_global_map[l] for l in base_traffic_labels_str]
         )
 
-    # The cache file now stores fused features for the full dataset; one file is shared across all OOD settings
-    # Unified cache file – contains fused features for the entire dataset (no OOD suffix needed)
-    cache_file_name = "fused_features_for_mlp_ALL.pt"
-    cache_file = os.path.join(dataset_root, dataset_name, "raw", cache_file_name)
+    all_processed_data = prefused_data_list
 
-    # Use pre-fused data if provided, otherwise try to load from cache
-    if prefused_data_list is not None:
-        print(f"Using provided pre-fused data for MLP data loading.")
-        all_processed_data = prefused_data_list
-    elif os.path.exists(cache_file):
-        print(f"Loading pre-fused data from cache: {cache_file}")
-        all_processed_data = torch.load(cache_file)
-    else:
-        raise FileNotFoundError(f"Pre-fused data cache not found at {cache_file}. Please run the feature fusion step first, or provide `prefused_data_list`.")
 
-    # Determine input_dim from the first sample's fused_features
-    if not all_processed_data:
-        raise ValueError("No data found in pre-fused list. Cannot determine INPUT_DIM.")
-    args.INPUT_DIM = all_processed_data[0]["fused_features"].shape[0]
-    print(f"MLP Input Dimension (Fused Features): {args.INPUT_DIM}")
+    first_sample = all_processed_data[0]
+    dim_sum = 0
+    for comp in selected_components:
+        dim_sum += first_sample[comp].shape[0]
+    args.INPUT_DIM = dim_sum
+    print(f"MLP Input Dimension (Dynamic Fusion): {args.INPUT_DIM}")
 
     args.NUM_BASE_CLASSES = len(base_traffic_labels_str)
     args.NUM_ALL_CLASSES = len(all_class_labels_global_map)
 
     base_class_global_indices_sorted = sorted([all_class_labels_global_map[l] for l in base_traffic_labels_str])
     
-    # Reconstruct a DataFrame-like structure for splitting, using global_labels
     temp_df = pd.DataFrame([
         {
-            'fused_features': sample['fused_features'],
-            'label': sample['global_labels'].item(),
-            'raw_text': sample.get('raw_text', ""),
-            'p_g_logits': sample['p_g_logits']
+            'textual_emb':      sample.get('textual_emb'),
+            'numerical_feats':  sample.get('numerical_feats'),
+            'explanation_emb':  sample.get('explanation_emb'),
+            'prior_logits':     sample.get('prior_logits'),
+            'label':            sample['global_labels'].item(),
+            'raw_text':         sample.get('raw_text', "")
         }
         for sample in all_processed_data
     ])
@@ -140,7 +121,6 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
 
     df_base_pool = df_train_val_pool[df_train_val_pool['label'].isin(base_class_global_indices_sorted)].copy()
     
-    # New classes for validation/test are those global labels that are NOT base classes
     new_class_global_indices = [all_class_labels_global_map[l] for l in new_traffic_labels_str]
     df_new_pool = df_train_val_pool[df_train_val_pool['label'].isin(new_class_global_indices)].copy()
 
@@ -158,18 +138,15 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
         df_train_decoop = pd.concat([df_train_decoop, train_samples], ignore_index=True)
 
     train_indices_used = df_train_decoop.index
-
     df_remaining_base_for_val = df_base_pool.drop(train_indices_used, errors='ignore')
-    
     df_val = pd.concat([df_remaining_base_for_val, df_new_pool], ignore_index=True).sample(frac=1, random_state=42)
 
     df_test = df_test_full
 
-    print(f"DECOOP Few-Shot Train (Base Classes Only): {len(df_train_decoop)} samples")
-    print(f"Final Validation (Mixed Classes for Calibration): {len(df_val)} samples")
-    print(f"Full Test (Mixed Classes): {len(df_test)} samples")
+    print(f"Train: {len(df_train_decoop)} samples")
+    print(f"Val: {len(df_val)} samples")
+    print(f"Test: {len(df_test)} samples")
     
-    # Convert dataframes back to list of dicts for MLPCSVTrafficDataset
     def df_to_mlp_dataset_format(dataframe, is_training_data_flag, base_class_global_indices_local=None):
         processed_list = []
         global_to_local_base_map = None
@@ -178,21 +155,26 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
             global_to_local_base_map = {global_idx: local_idx for local_idx, global_idx in enumerate(sorted_base_class_global_indices)}
 
         for idx, row in dataframe.iterrows():
-            fused_features = row['fused_features']
             global_label_numerical = row['label']
 
             target_label_numerical = global_label_numerical
             if is_training_data_flag:
                 target_label_numerical = global_to_local_base_map.get(global_label_numerical, -1)
-                if target_label_numerical == -1:
-                    raise ValueError(f"Training data error: label {global_label_numerical} not in base_class set for training (idx={idx}).")
+
+            parts = []
+            for comp in selected_components:
+                part = row[comp]
+                tensor_part = part if isinstance(part, torch.Tensor) \
+                              else torch.tensor(part, dtype=torch.float32)
+                parts.append(tensor_part)
+            features_tensor = torch.cat(parts, dim=0)
 
             processed_list.append({
-                "features": fused_features,                                # Fused vector incl. explanation
+                "features": features_tensor,
                 "labels": torch.tensor(target_label_numerical, dtype=torch.long),
                 "raw_text": row['raw_text'],
                 "global_labels": torch.tensor(global_label_numerical, dtype=torch.long),
-                "p_g_logits": row['p_g_logits']                            # tensor with softlogits
+                "prior_logits": row['prior_logits']
             })
         return processed_list
 
@@ -204,28 +186,20 @@ def loadData(args, full_traffic_labels_list, all_class_labels_global_map, ood_la
     val_dataset = MLPCSVTrafficDataset(val_numerical_list)
     test_dataset = MLPCSVTrafficDataset(test_numerical_list)
 
-    # ------------------------------------------------------------------
-    # Save the freshly created splits for future runs
-    # ------------------------------------------------------------------
+
     split_cache_file = os.path.join(
         dataset_root, dataset_name, "raw",
-        f"splits_SPC{num_samples_per_class}.pt"
+        f"splits_{comp_id}_SPC{num_samples_per_class}.pt"
     )
-    try:
-        torch.save(
-            {
-                "train": train_numerical_list,
-                "val":   val_numerical_list,
-                "test":  test_numerical_list
-            },
-            split_cache_file
-        )
-        print(f"[Split‑Cache] Train/Val/Test splits saved to: {split_cache_file}")
-    except Exception as e:
-        print(f"[Split‑Cache] Warning: could not save splits – {e}")
 
-    # The cache for fused data is handled by the `fuse_features_and_cache` function.
-    # We do not re-save here to avoid redundant or inconsistent caching.
+    torch.save(
+        {
+            "train": train_numerical_list,
+            "val":   val_numerical_list,
+            "test":  test_numerical_list
+        },
+        split_cache_file
+    )
 
     return train_dataset, val_dataset, test_dataset, args, base_class_global_indices_sorted
 

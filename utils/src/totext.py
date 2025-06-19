@@ -389,16 +389,24 @@ def fuse_features_and_cache(args, all_labels_list, all_class_labels_global_map, 
             textual_embedding = outputs.last_hidden_state[:, 0].squeeze(0).cpu()  # (H,)
 
         # 4. Concatenate (Fuse) them
-        fused_vector = torch.cat([textual_embedding,
-                                  numerical_features_tensor,
-                                  explanation_tensor,
-                                  p_logits_trans], dim=0)
+        # fused_vector = torch.cat([textual_embedding,
+        #                           numerical_features_tensor,
+        #                           explanation_tensor,
+        #                           p_logits_trans], dim=0)
 
+        # --- Save both fused and disentangled feature components so that downstream
+        #     ablation experiments can select arbitrary subsets without regenerating
+        #     the cache. ---
         fused_data_list.append({
-            "fused_features": fused_vector,
+            # "fused_features": fused_vector,
+            # component tensors (for fine‑grained ablation)
+            "textual_emb": textual_embedding,                # (H,)
+            "numerical_feats": numerical_features_tensor,    # (N_num,)
+            "explanation_emb": explanation_tensor,           # (384,)
+            # meta‑data / labels
             "global_labels": torch.tensor(global_label_numerical, dtype=torch.long),
             "raw_text": full_input_text,
-            "p_g_logits": p_g_logits
+            "prior_logits": p_g_logits                         # (C_all,)
         })
 
     torch.save(fused_data_list, fused_cache_file)
