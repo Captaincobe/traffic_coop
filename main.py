@@ -1,15 +1,13 @@
-# main_mlp.py (Modified)
-
 import os
 
 import torch
-from utils.load_data import fuse_features_and_cache, loadData # Import the refactored data loading function
 import numpy as np
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.preprocessing import label_binarize
 from args import parameter_parser # Import argument parser
-from utils.model import DECOOPInferenceEngine, LLMTrafficDECOOP # Import the refactored model and inference engine
-
+from utils.Dataloader import loadData
+from utils.model import DECOOPInferenceEngine, LLMTrafficDECOOP
+from utils.src.totext import fuse_features_and_cache # Import the refactored model and inference engine
 
 
 

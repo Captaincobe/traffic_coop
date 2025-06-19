@@ -108,4 +108,9 @@ class EarlyStopping:
             # 考虑到LLMTrafficDECOOP的结构，保存其state_dict可能最简单
             self.best_model_state = model.state_dict()
             self.val_loss_min = val_loss
-            
+
+# --- Helper for KL Div ---
+def kl_divergence_loss_from_logits(pred_logits, target_logits_detached):
+    pred_log_probs = log_softmax(pred_logits, dim=1)
+    target_probs_detached = softmax(target_logits_detached, dim=1).detach()
+    return kl_div(pred_log_probs, target_probs_detached, reduction='batchmean', log_target=False)
